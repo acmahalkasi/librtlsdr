@@ -612,66 +612,68 @@ static void *multi_demod_thread_fn(void *arg)
 	t1_audio = t1_mpx;
 	while (!do_exit) {
 		safe_cond_wait(&mds->ready, &mds->ready_m);
-		if (do_exit)
-			break;
+		while (!do_exit) {
+			/* process (multiple) blocks per signaled condition */
+			read_idx = mds->buffer_read_idx;
+			buffer = &mds->buffers[read_idx];
+			if (buffer->is_free)
+				break;
+			mds->buffer_read_idx = (mds->buffer_read_idx + 1) % mds->num_circular_buffers;
+			pthread_rwlock_wrlock(&buffer->rw);	/* lock before reading into demod_thread_state.lowpassed */
 
-		gettimeofday(&t2, NULL);
-		diff_ms_mpx    = (t2.tv_sec  - t1_mpx.tv_sec) * 1000.0;
-		diff_ms_mpx   += (t2.tv_usec - t1_mpx.tv_usec) / 1000.0;
-		diff_ms_audio  = (t2.tv_sec  - t1_audio.tv_sec) * 1000.0;
-		diff_ms_audio += (t2.tv_usec - t1_audio.tv_usec) / 1000.0;
+			gettimeofday(&t2, NULL);
+			diff_ms_mpx    = (t2.tv_sec  - t1_mpx.tv_sec) * 1000.0;
+			diff_ms_mpx   += (t2.tv_usec - t1_mpx.tv_usec) / 1000.0;
+			diff_ms_audio  = (t2.tv_sec  - t1_audio.tv_sec) * 1000.0;
+			diff_ms_audio += (t2.tv_usec - t1_audio.tv_usec) / 1000.0;
 
-		/* check limits first. else, files are immediately closed again, cause diff_ms still > .. */
-		if (unlikely(!mpx_is_limited && mds->mpx_limit_duration > 0 && diff_ms_mpx > 1000.0 * mds->mpx_limit_duration)) {
-			mpx_is_limited = 1;
-			close_all_channel_outputs(mds, 1, 0, 1);	/* close mpx files or pipes */
-			if (verbosity)
-				fprintf(stderr, "dongle %s: closing mpx stream, cause of limit\n", dongleid);
-		}
-		if (unlikely(!audio_is_limited && mds->audio_limit_duration > 0 && diff_ms_audio > 1000.0 * mds->audio_limit_duration)) {
-			audio_is_limited = 1;
-			close_all_channel_outputs(mds, 0, 1, 1);	/* close audio files or pipes */
-			if (verbosity)
-				fprintf(stderr, "dongle %s: closing audio stream, cause of limit\n", dongleid);
-		}
+			/* check limits first. else, files are immediately closed again, cause diff_ms still > .. */
+			if (unlikely(!mpx_is_limited && mds->mpx_limit_duration > 0 && diff_ms_mpx > 1000.0 * mds->mpx_limit_duration)) {
+				mpx_is_limited = 1;
+				close_all_channel_outputs(mds, 1, 0, 1);	/* close mpx files or pipes */
+				if (verbosity)
+					fprintf(stderr, "dongle %s: closing mpx stream, cause of limit\n", dongleid);
+			}
+			if (unlikely(!audio_is_limited && mds->audio_limit_duration > 0 && diff_ms_audio > 1000.0 * mds->audio_limit_duration)) {
+				audio_is_limited = 1;
+				close_all_channel_outputs(mds, 0, 1, 1);	/* close audio files or pipes */
+				if (verbosity)
+					fprintf(stderr, "dongle %s: closing audio stream, cause of limit\n", dongleid);
+			}
 
-		if (unlikely(init_open || (mds->mpx_split_duration > 0 && diff_ms_mpx > 1000.0 * mds->mpx_split_duration))) {
-			time_t current_time = time(NULL);
-			struct tm *tm = localtime(&current_time);
-			const int milli = (int)(t2.tv_usec/1000);
-			close_all_channel_outputs(mds, 1, 0, 1);	/* close mpx files or pipes */
-			open_all_mpx_channel_outputs(mds, mpx_rate, tm, milli);
-			mpx_is_limited = 0;
-			t1_mpx = t2;
-		}
-		if (unlikely(init_open || (mds->audio_split_duration > 0 && diff_ms_audio > 1000.0 * mds->audio_split_duration))) {
-			time_t current_time = time(NULL);
-			struct tm *tm = localtime(&current_time);
-			const int milli = (int)(t2.tv_usec/1000);
-			close_all_channel_outputs(mds, 0, 1, 1);	/* close audio files or pipes */
-			open_all_audio_channel_outputs(mds, audio_rate, tm, milli);
-			audio_is_limited = 0;
-			t1_audio = t2;
-		}
-		init_open = 0;
+			if (unlikely(init_open || (mds->mpx_split_duration > 0 && diff_ms_mpx > 1000.0 * mds->mpx_split_duration))) {
+				time_t current_time = time(NULL);
+				struct tm *tm = localtime(&current_time);
+				const int milli = (int)(t2.tv_usec/1000);
+				close_all_channel_outputs(mds, 1, 0, 1);	/* close mpx files or pipes */
+				open_all_mpx_channel_outputs(mds, mpx_rate, tm, milli);
+				mpx_is_limited = 0;
+				t1_mpx = t2;
+			}
+			if (unlikely(init_open || (mds->audio_split_duration > 0 && diff_ms_audio > 1000.0 * mds->audio_split_duration))) {
+				time_t current_time = time(NULL);
+				struct tm *tm = localtime(&current_time);
+				const int milli = (int)(t2.tv_usec/1000);
+				close_all_channel_outputs(mds, 0, 1, 1);	/* close audio files or pipes */
+				open_all_audio_channel_outputs(mds, audio_rate, tm, milli);
+				audio_is_limited = 0;
+				t1_audio = t2;
+			}
+			init_open = 0;
 
-		read_idx = mds->buffer_read_idx;
-		mds->buffer_read_idx = (mds->buffer_read_idx + 1) % mds->num_circular_buffers;
-		buffer = &mds->buffers[read_idx];
-		pthread_rwlock_wrlock(&buffer->rw);	/* lock before reading into demod_thread_state.lowpassed */
+			for (ch = 0; ch < mds->channel_count; ++ch) {
+				mds->demod_states[ch].lp_len = buffer->lp_len;
+				mixer_apply(&mds->mixers[ch], buffer->lp_len, buffer->lowpassed, mds->demod_states[ch].lowpassed);
+			}
 
-		for (ch = 0; ch < mds->channel_count; ++ch) {
-			mds->demod_states[ch].lp_len = buffer->lp_len;
-			mixer_apply(&mds->mixers[ch], buffer->lp_len, buffer->lowpassed, mds->demod_states[ch].lowpassed);
-		}
+			++mds->buffer_read_counter;
+			buffer->is_free = 1;	/* buffer can be written again */
+			/* we only need to lock the lowpassed buffer of demod_thread_state */
+			pthread_rwlock_unlock(&buffer->rw);
 
-		++mds->buffer_read_counter;
-		buffer->is_free = 1;	/* buffer can be written again */
-		/* we only need to lock the lowpassed buffer of demod_thread_state */
-		pthread_rwlock_unlock(&buffer->rw);
-
-		for (ch = 0; ch < mds->channel_count; ++ch) {
-			full_demod(&mds->demod_states[ch], mds->fmpx[ch], mds->faudio[ch]);
+			for (ch = 0; ch < mds->channel_count; ++ch) {
+				full_demod(&mds->demod_states[ch], mds->fmpx[ch], mds->faudio[ch]);
+			}
 		}
 	}
 	return 0;
