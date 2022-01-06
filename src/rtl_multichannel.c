@@ -87,6 +87,10 @@ static int MinCaptureRate = 1000000;
 static volatile int do_exit = 0;
 static int verbosity = 0;
 static const char * dongleid = "?";
+static unsigned on_overflow = 0;		/* 0: (q)uit;  1: (d)iscard all buffers;  2: (i)gnore/discard single buffer */
+static unsigned num_detected_overflows = 0;
+static atomic_uint num_discarded_buffers = 0;
+static unsigned num_consec_overflows = 0;
 
 time_t stop_time;
 int duration = 0;
@@ -95,6 +99,7 @@ struct demod_input_buffer
 {
 	int16_t * lowpassed; /* input and decimated quadrature I/Q sample-pairs */
 	int	  lp_len;		/* number of valid samples in lowpassed[] - NOT quadrature I/Q sample-pairs! */
+	int	  was_overflow;	/* flag, if there was an overflow */
 	atomic_int  is_free;	/* 0 == free; 1 == occupied with data */
 	pthread_rwlock_t	rw;
 	struct timeval		tv;	/* timestamp of reception */
@@ -125,9 +130,9 @@ struct demod_thread_state
 	int	  dummyPadB[128 / sizeof(int)];
 	int	  buffer_read_idx;
 	int	  dummyPadC[128 / sizeof(int)];
-	atomic_uint buffer_write_counter;
+	atomic_uint buffer_rcv_counter;	/* buffers received from dongle in callback */
 	int	  dummyPadD[128 / sizeof(int)];
-	atomic_uint buffer_read_counter;
+	atomic_uint buffer_proc_counter;	/* processed buffers */
 	int	  dummyPadE[128 / sizeof(int)];
 
 	FILE    * faudio[MAX_NUM_CHANNELS];
@@ -212,6 +217,8 @@ void usage(void)
 		"\t\tthe default filename pattern: \"f:%s\"\n"
 		"\t\t  substitutions, additional to strftime(): %%f for frequency, %%kf for frequency in kHz,\n"
 		"\t\t  %%sf for samplerate, %%cf for channel number, and %%# for milliseconds of time\n"
+		"\t[-o on_overflow (default: (q)uit), other options: (d)iscard all buffers, (i)gnore and discard single buffer\n"
+		"\t\t  discard does close/reopen the files or pipes\n"
 		"\t[-r resample_rate (default: none / same as -s)]\n"
 		"\t[-d device_index or serial (default: 0)]\n"
 		"\t[-T enable bias-T on GPIO PIN 0 (works for rtl-sdr.com v3 dongles)]\n"
@@ -549,23 +556,30 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 		return;
 	}
 
+	++mds->buffer_rcv_counter;
 	write_idx = mds->buffer_write_idx;
-	mds->buffer_write_idx = (mds->buffer_write_idx + 1) % mds->num_circular_buffers;
 	buffer = &mds->buffers[write_idx];
 	pthread_rwlock_wrlock(&buffer->rw);	/* lock before writing into demod_thread_state.lowpassed */
 	if (!buffer->is_free) {
-		unsigned wr_counter = mds->buffer_write_counter;
-		unsigned rd_counter = mds->buffer_read_counter;
-		do_exit = 1;
-		fprintf(stderr, "\n\n*** dongle %s: Overflow of circular input buffers, exiting! ***\n", dongleid);
-		fprintf(stderr, "dongle %s: Overflow happened after having read %u buffers from dongle.\n", dongleid, wr_counter);
-		fprintf(stderr, "dongle %s: Overflow happened after having processed %u buffers.\n", dongleid, rd_counter);
-		fprintf(stderr, "dongle %s: processing has %u buffers open ..\n\n", dongleid, wr_counter - rd_counter );
-
-		rtlsdr_cancel_async(dongle.dev);
 		pthread_rwlock_unlock(&buffer->rw);
+		++num_detected_overflows;
+		++num_consec_overflows;
+		++num_discarded_buffers;	/* this block is definitely discarded */
+		if (!on_overflow) {
+			unsigned rcv_counter = mds->buffer_rcv_counter;
+			unsigned proc_counter = mds->buffer_proc_counter;
+			do_exit = 1;
+			rtlsdr_cancel_async(dongle.dev);
+			fprintf(stderr, "\n\n*** dongle %s: Overflow of circular input buffers, exiting! ***\n", dongleid);
+			fprintf(stderr, "dongle %s: Overflow happened after having read %u buffers from dongle.\n", dongleid, rcv_counter);
+			fprintf(stderr, "dongle %s: Overflow happened after having processed %u buffers.\n", dongleid, proc_counter);
+			fprintf(stderr, "dongle %s: There are %u unprocessed buffers\n\n", dongleid, rcv_counter - proc_counter );
+		}
 		return;
 	}
+
+	/* increment with a free writable buffer */
+	mds->buffer_write_idx = (mds->buffer_write_idx + 1) % mds->num_circular_buffers;
 
 	/* getting timestamp here, leads to more accurate timestamp - compared to multi_demod_thread_fn() */
 	gettimeofday(&buffer->tv, NULL);
@@ -576,6 +590,18 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 		rtlsdr_cancel_async(dongle.dev);
 		pthread_rwlock_unlock(&buffer->rw);
 		return;
+	}
+
+	buffer->was_overflow = 0;	/* assume so */
+	if (num_consec_overflows) {
+		if (on_overflow == 1) {
+			fprintf(stderr, "*** dongle %s: +%u overflows of circular input buffers, %u total: discard all buffers ***\n", dongleid, num_consec_overflows, num_detected_overflows);
+			buffer->was_overflow = 1;	/* report overflows with the buffer contents */
+		}
+		else
+			fprintf(stderr, "*** dongle %s: +%u overflows of circular input buffers, %u total: ignore/discard single buffer ***\n", dongleid, num_consec_overflows, num_detected_overflows);
+
+		num_consec_overflows = 0;
 	}
 
 	buf16 = buffer->lowpassed;
@@ -590,7 +616,6 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 	}
 
 	buffer->lp_len = len;
-	++mds->buffer_write_counter;
 
 	buffer->is_free = 0;
 	pthread_rwlock_unlock(&buffer->rw);
@@ -607,6 +632,7 @@ static void *multi_demod_thread_fn(void *arg)
 	int init_open = 1;
 	int mpx_is_limited = 1;
 	int audio_is_limited = 1;
+	unsigned num_remove_buffers = 0;
 	const unsigned mpx_rate = mds->demod_states[0].rate_out;
 	const unsigned audio_rate = mds->demod_states[0].rate_out2 ? (unsigned)mds->demod_states[0].rate_out2 : mpx_rate;
 	struct demod_input_buffer *buffer;
@@ -623,6 +649,29 @@ static void *multi_demod_thread_fn(void *arg)
 				break;
 			mds->buffer_read_idx = (mds->buffer_read_idx + 1) % mds->num_circular_buffers;
 			pthread_rwlock_wrlock(&buffer->rw);	/* lock before reading into demod_thread_state.lowpassed */
+
+			if (num_remove_buffers || buffer->was_overflow) {
+				if (buffer->was_overflow) {
+					num_remove_buffers = mds->num_circular_buffers;	/* discard all buffers */
+					init_open = 1;	/* reopen streams directly after overflow? */
+				}
+				buffer->is_free = 1;			/* buffer can be written again */
+				pthread_rwlock_unlock(&buffer->rw);	/* unlock buffer as early as possible */
+
+				++num_discarded_buffers;
+				--num_remove_buffers;
+				if (!num_remove_buffers && verbosity) {
+					fprintf(stderr, "dongle %s: discarded %u buffers, cause of overflows\n", dongleid, num_discarded_buffers);
+				}
+				if (!mpx_is_limited || !audio_is_limited) {
+					close_all_channel_outputs(mds, 1, 1, 1);	/* close mpx and audio files or pipes */
+					mpx_is_limited = 1;
+					audio_is_limited = 1;
+					if (verbosity)
+						fprintf(stderr, "dongle %s: closing mpx and audio streams, cause of overflow\n", dongleid);
+				}
+				continue;
+			}
 
 			diff_ms_mpx    = (buffer->tv.tv_sec  - t1_mpx.tv_sec) * 1000.0;
 			diff_ms_mpx   += (buffer->tv.tv_usec - t1_mpx.tv_usec) / 1000.0;
@@ -666,7 +715,7 @@ static void *multi_demod_thread_fn(void *arg)
 				mixer_apply(&mds->mixers[ch], buffer->lp_len, buffer->lowpassed, mds->demod_states[ch].lowpassed);
 			}
 
-			++mds->buffer_read_counter;
+			++mds->buffer_proc_counter;
 			buffer->is_free = 1;	/* buffer can be written again */
 			/* we only need to lock the lowpassed buffer of demod_thread_state */
 			pthread_rwlock_unlock(&buffer->rw);
@@ -841,8 +890,8 @@ void demod_thread_state_init(struct demod_thread_state *s)
 	s->num_circular_buffers = 4;
 	s->buffer_write_idx = 0;
 	s->buffer_read_idx = 0;
-	s->buffer_write_counter = 0;
-	s->buffer_read_counter = 0;
+	s->buffer_rcv_counter = 0;
+	s->buffer_proc_counter = 0;
 	s->mpx_split_duration = -1;
 	s->audio_split_duration = -1;
 	s->mpx_limit_duration = 0;
@@ -953,7 +1002,7 @@ int main(int argc, char **argv)
 	demod_thread_state_init(&dm_thr);
 	demod = &dm_thr.demod_states[0];
 
-	while ((opt = getopt(argc, argv, "d:f:g:m:s:a:x:t:l:r:p:R:E:O:F:A:M:hTq:c:w:W:n:D:v")) != -1) {
+	while ((opt = getopt(argc, argv, "d:f:g:m:s:a:x:t:l:r:p:R:E:O:o:F:A:M:hTq:c:w:W:n:D:v")) != -1) {
 		switch (opt) {
 		case 'd':
 			dongle.dev_index = verbose_device_search(optarg);
@@ -1038,6 +1087,17 @@ int main(int argc, char **argv)
 			break;
 		case 'O':
 			rtlOpts = optarg;
+			break;
+		case 'o':
+			if (!strcmp("q", optarg) || !strcmp("quit", optarg)) {
+				on_overflow = 0;
+			} else if (!strcmp("d", optarg) || !strcmp("discard", optarg)) {
+				on_overflow = 1;
+			} else if (!strcmp("i", optarg) || !strcmp("ign", optarg) || !strcmp("ignore", optarg)) {
+				on_overflow = 2;
+			} else {
+				fprintf(stderr, "Warning: unknown argument for option '-o' on overflow: %s\n", optarg);
+			}
 			break;
 		case 'q':
 			dongle.rdc_block_const = atoi(optarg);
@@ -1313,6 +1373,10 @@ int main(int argc, char **argv)
 	if (verbosity)
 		fprintf(stderr, "closing dongle and exit\n");
 	rtlsdr_close(dongle.dev);
+
+	if (num_detected_overflows || num_discarded_buffers || verbosity)
+		fprintf(stderr, "dongle %s: detected %u overflows, discarded %u of %u received buffers in total\n", dongleid, num_detected_overflows, num_discarded_buffers, dm_thr.buffer_rcv_counter);
+
 	return r >= 0 ? r : -r;
 }
 
