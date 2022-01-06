@@ -97,6 +97,7 @@ struct demod_input_buffer
 	int	  lp_len;		/* number of valid samples in lowpassed[] - NOT quadrature I/Q sample-pairs! */
 	atomic_int  is_free;	/* 0 == free; 1 == occupied with data */
 	pthread_rwlock_t	rw;
+	struct timeval		tv;	/* timestamp of reception */
 };
 
 struct p_closing_thread
@@ -543,17 +544,9 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 	struct demod_input_buffer *buffer;
 	int16_t *buf16;
 	int i, write_idx;
-	time_t rawtime;
 
-	if (do_exit) {
-		return;}
-	if (!ctx) {
-		return;}
-	time(&rawtime);
-	if (duration > 0 && rawtime >= stop_time) {
-		do_exit = 1;
-		fprintf(stderr, "dongle %s: Time expired, exiting!\n", dongleid);
-		rtlsdr_cancel_async(dongle.dev);
+	if (do_exit || !ctx) {
+		return;
 	}
 
 	write_idx = mds->buffer_write_idx;
@@ -569,6 +562,17 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 		fprintf(stderr, "dongle %s: Overflow happened after having processed %u buffers.\n", dongleid, rd_counter);
 		fprintf(stderr, "dongle %s: processing has %u buffers open ..\n\n", dongleid, wr_counter - rd_counter );
 
+		rtlsdr_cancel_async(dongle.dev);
+		pthread_rwlock_unlock(&buffer->rw);
+		return;
+	}
+
+	/* getting timestamp here, leads to more accurate timestamp - compared to multi_demod_thread_fn() */
+	gettimeofday(&buffer->tv, NULL);
+
+	if (duration > 0 && buffer->tv.tv_sec >= stop_time) {
+		do_exit = 1;
+		fprintf(stderr, "dongle %s: Time expired, exiting!\n", dongleid);
 		rtlsdr_cancel_async(dongle.dev);
 		pthread_rwlock_unlock(&buffer->rw);
 		return;
@@ -597,8 +601,7 @@ static void *multi_demod_thread_fn(void *arg)
 {
 	struct demod_thread_state *mds = arg;
 
-	struct timeval t1_mpx, t1_audio, t2;
-	struct timeval timestamp;
+	struct timeval t1_mpx, t1_audio;
 	double diff_ms_mpx, diff_ms_audio;
 	int ch, read_idx;
 	int init_open = 1;
@@ -621,11 +624,10 @@ static void *multi_demod_thread_fn(void *arg)
 			mds->buffer_read_idx = (mds->buffer_read_idx + 1) % mds->num_circular_buffers;
 			pthread_rwlock_wrlock(&buffer->rw);	/* lock before reading into demod_thread_state.lowpassed */
 
-			gettimeofday(&t2, NULL);
-			diff_ms_mpx    = (t2.tv_sec  - t1_mpx.tv_sec) * 1000.0;
-			diff_ms_mpx   += (t2.tv_usec - t1_mpx.tv_usec) / 1000.0;
-			diff_ms_audio  = (t2.tv_sec  - t1_audio.tv_sec) * 1000.0;
-			diff_ms_audio += (t2.tv_usec - t1_audio.tv_usec) / 1000.0;
+			diff_ms_mpx    = (buffer->tv.tv_sec  - t1_mpx.tv_sec) * 1000.0;
+			diff_ms_mpx   += (buffer->tv.tv_usec - t1_mpx.tv_usec) / 1000.0;
+			diff_ms_audio  = (buffer->tv.tv_sec  - t1_audio.tv_sec) * 1000.0;
+			diff_ms_audio += (buffer->tv.tv_usec - t1_audio.tv_usec) / 1000.0;
 
 			/* check limits first. else, files are immediately closed again, cause diff_ms still > .. */
 			if (unlikely(!mpx_is_limited && mds->mpx_limit_duration > 0 && diff_ms_mpx > 1000.0 * mds->mpx_limit_duration)) {
@@ -642,22 +644,20 @@ static void *multi_demod_thread_fn(void *arg)
 			}
 
 			if (unlikely(init_open || (mds->mpx_split_duration > 0 && diff_ms_mpx > 1000.0 * mds->mpx_split_duration))) {
-				time_t current_time = time(NULL);
-				struct tm *tm = localtime(&current_time);
-				const int milli = (int)(t2.tv_usec/1000);
+				struct tm *tm = localtime(&buffer->tv.tv_sec);
+				const int milli = (int)(buffer->tv.tv_usec/1000);
 				close_all_channel_outputs(mds, 1, 0, 1);	/* close mpx files or pipes */
 				open_all_mpx_channel_outputs(mds, mpx_rate, tm, milli);
 				mpx_is_limited = 0;
-				t1_mpx = t2;
+				t1_mpx = buffer->tv;
 			}
 			if (unlikely(init_open || (mds->audio_split_duration > 0 && diff_ms_audio > 1000.0 * mds->audio_split_duration))) {
-				time_t current_time = time(NULL);
-				struct tm *tm = localtime(&current_time);
-				const int milli = (int)(t2.tv_usec/1000);
+				struct tm *tm = localtime(&buffer->tv.tv_sec);
+				const int milli = (int)(buffer->tv.tv_usec/1000);
 				close_all_channel_outputs(mds, 0, 1, 1);	/* close audio files or pipes */
 				open_all_audio_channel_outputs(mds, audio_rate, tm, milli);
 				audio_is_limited = 0;
-				t1_audio = t2;
+				t1_audio = buffer->tv;
 			}
 			init_open = 0;
 
