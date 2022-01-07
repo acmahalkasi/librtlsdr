@@ -386,20 +386,21 @@ static FILE * create_iq_file(const char* filename, const char * st) {
 
 static void *close_pipe_fn(void* arg) {
 	struct p_closing_thread *ct = arg;
+	FILE *f = NULL;
 	while (!do_exit) {
 		safe_cond_wait(&ct->ready, &ct->ready_m);
-		if (do_exit)
-			break;
-		if(!ct->has_file){
-			fprintf(stderr, "dongle %s: Error, has file for %s channel %d\n", dongleid, (ct->is_mpx ? "mpx" : "audio"), ct->ch);
+		while (!do_exit) {
+			/* close (multiple) files per signaled condition */
+			if (!ct->has_file)
+				break;
+			/* copy fptr, to keep ct->has_file == 1 as short as possible */
+			f = ct->fptr;
 			ct->has_file = 0;
-			continue;
+			if (!f)
+				continue;
+			fflush(f);
+			pclose(f);
 		}
-		if (ct->fptr){
-			fflush(ct->fptr);
-			pclose(ct->fptr);
-		}
-		ct->has_file = 0;
 	}
 	return 0;
 }
