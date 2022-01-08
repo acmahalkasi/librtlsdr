@@ -91,6 +91,8 @@ static unsigned on_overflow = 0;		/* 0: (q)uit;  1: (d)iscard all buffers;  2: (
 static unsigned num_detected_overflows = 0;
 static atomic_uint num_discarded_buffers = 0;
 static unsigned num_consec_overflows = 0;
+static struct timeval	tv_overflow_start;
+
 
 time_t stop_time;
 int duration = 0;
@@ -563,6 +565,8 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 	pthread_rwlock_wrlock(&buffer->rw);	/* lock before writing into demod_thread_state.lowpassed */
 	if (!buffer->is_free) {
 		pthread_rwlock_unlock(&buffer->rw);
+		if (!num_consec_overflows)
+			gettimeofday(&tv_overflow_start, NULL);
 		++num_detected_overflows;
 		++num_consec_overflows;
 		++num_discarded_buffers;	/* this block is definitely discarded */
@@ -599,8 +603,14 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 			fprintf(stderr, "*** dongle %s: +%u overflows of circular input buffers, %u total: discard all buffers ***\n", dongleid, num_consec_overflows, num_detected_overflows);
 			buffer->was_overflow = 1;	/* report overflows with the buffer contents */
 		}
-		else
-			fprintf(stderr, "*** dongle %s: +%u overflows of circular input buffers, %u total: ignore/discard single buffer ***\n", dongleid, num_consec_overflows, num_detected_overflows);
+		else {
+			char acTime[128];
+			struct tm *tm = localtime(&tv_overflow_start.tv_sec);
+			const int milli = (int)(tv_overflow_start.tv_usec/1000);
+			strftime(acTime, ARRAY_LEN(acTime), "%F %T", tm);
+			fprintf(stderr, "*** dongle %s: %s.%03d: +%u overflows of circular input buffers, %u total: ignore/discard single buffer ***\n",
+				dongleid, acTime, milli, num_consec_overflows, num_detected_overflows);
+		}
 
 		num_consec_overflows = 0;
 	}
