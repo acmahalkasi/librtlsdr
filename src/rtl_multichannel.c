@@ -185,7 +185,7 @@ struct dongle_state
 struct dongle_state dongle;
 struct demod_thread_state dm_thr;
 
-void usage(void)
+void usage(int verbosity)
 {
 	fprintf(stderr,
 		"rtl_multichannel, a multichannel demodulator for RTL2832 based SDR-receivers\n"
@@ -223,6 +223,7 @@ void usage(void)
 		"\t\t  discard does close/reopen the files or pipes\n"
 		"\t[-r resample_rate (default: none / same as -s)]\n"
 		"\t[-d device_index or serial (default: 0)]\n"
+		"%s"
 		"\t[-T enable bias-T on GPIO PIN 0 (works for rtl-sdr.com v3 dongles)]\n"
 		"\t[-D direct_sampling_mode (default: 0, 1 = I, 2 = Q, 3 = I below threshold, 4 = Q below threshold)]\n"
 		"\t[-D direct_sampling_threshold_frequency (default: 0 use tuner specific frequency threshold for 3 and 4)]\n"
@@ -240,7 +241,6 @@ void usage(void)
 		"\t	rtlagc: enable rtl2832's digital agc (default: off)\n"
 		"\t	deemp:  enable de-emphasis filter\n"
 		"\t	direct: enable direct sampling (bypasses tuner, uses rtl2832 xtal)\n"
-		"%s"
 		"\t[-q dc_avg_factor for option rdc (default: 9)]\n"
 		/* "\t[-H write wave Header to file (default: off)]\n" */
 		"Experimental options:\n"
@@ -251,7 +251,7 @@ void usage(void)
 		"\n"
 		, DEFAULT_AUDIO_PIPE_PATTERN, DEFAULT_AUDIO_FILE_PATTERN
 		, DEFAULT_MPX_PIPE_PATTERN, DEFAULT_MPX_FILE_PATTERN
-		, rtlsdr_get_opt_help(1) );
+		, rtlsdr_get_opt_help(verbosity) );
 	exit(1);
 }
 
@@ -1241,7 +1241,7 @@ int main(int argc, char **argv)
 		case 'h':
 		case '?':
 		default:
-			usage();
+			usage(verbosity);
 			break;
 		}
 	}
