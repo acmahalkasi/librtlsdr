@@ -1000,16 +1000,17 @@ void demod_init(struct demod_state *s, int init_fields, int init_mem)
 	if (init_mem) {
 		s->lowpassed = (int16_t*)malloc( sizeof(int16_t) * MAXIMUM_BUF_LENGTH );
 		s->result = (int16_t*)malloc( sizeof(int16_t) * MAXIMUM_BUF_LENGTH );
-		s->result_mpx = (int16_t*)malloc( sizeof(int16_t) * MAXIMUM_BUF_LENGTH );
 	}
 }
 
-void demod_copy_fields(struct demod_state *dest, struct demod_state *src)
+void demod_copy_fields(struct demod_state *dest, const struct demod_state *src)
 {
 	/* save memory pointers */
 	int16_t * lowpassed = dest->lowpassed;
 	int16_t * result = dest->result;
 
+	if (dest == src)
+		return;
 	*dest = *src;
 
 	/* restore the pointers */

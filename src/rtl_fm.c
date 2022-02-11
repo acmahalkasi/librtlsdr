@@ -70,9 +70,6 @@ static int OutputToStdout = 1;
 static int MinCaptureRate = 1000000;
 
 static volatile int do_exit = 0;
-static int lcm_post[17] = {1,1,1,3,1,5,3,7,1,9,5,11,3,13,7,15,1};
-static int ACTUAL_BUF_LENGTH;
-
 static int verbosity = 0;
 static int printLevels = 0;
 static int printLevelNo = 1;
@@ -134,7 +131,6 @@ struct cmd_state
 
 struct dongle_state
 {
-	pthread_t thread;
 	rtlsdr_dev_t *dev;
 	int	  dev_index;
 	uint64_t userFreq;
@@ -175,7 +171,6 @@ struct output_state
 
 struct controller_state
 {
-	int	  exit_flag;
 	pthread_t thread;
 	uint32_t freqs[FREQUENCIES_LIMIT];
 	int	  freq_len;
@@ -195,7 +190,7 @@ struct controller_state controller;
 struct cmd_state cmd;
 
 
-void usage(void)
+void usage(int verbosity)
 {
 	fprintf(stderr,
 		"rtl_fm, a simple demodulator for RTL2832 based SDR-receivers\n"
@@ -221,6 +216,7 @@ void usage(void)
 		"\t	raw mode outputs 2x16 bit IQ pairs\n"
 		"\t[-s sample_rate (default: 24k)]\n"
 		"\t[-d device_index or serial (default: 0)]\n"
+		"%s"
 		"\t[-T enable bias-T on GPIO PIN 0 (works for rtl-sdr.com v3 dongles)]\n"
 		"\t[-D direct_sampling_mode (default: 0, 1 = I, 2 = Q, 3 = I below threshold, 4 = Q below threshold)]\n"
 		"\t[-D direct_sampling_threshold_frequency (default: 0 use tuner specific frequency threshold for 3 and 4)]\n"
@@ -252,7 +248,6 @@ void usage(void)
 		"\t	bcc:    use tuner bandwidths center as band center (default)\n"
 		"\t	bclo:   use tuner bandwidths low  corner as band center\n"
 		"\t	bchi:   use tuner bandwidths high corner as band center\n"
-		"%s"
 		"\t[-q dc_avg_factor for option rdc (default: 9)]\n"
 		"\t[-n disables demodulation output to stdout/file]\n"
 		"\t[-H write wave Header to file (default: off)]\n"
@@ -280,7 +275,7 @@ void usage(void)
 		"\t		   | aplay -r 24000 -f S16_LE -t raw -c 1\n"
 		"\t  -M wbfm  | play -r 32k ... \n"
 		"\t  -s 22050 | multimon -t raw /dev/stdin\n\n"
-		, rtlsdr_get_opt_help(1) );
+		, rtlsdr_get_opt_help(verbosity) );
 	exit(1);
 }
 
@@ -733,13 +728,6 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 	safe_cond_signal(&dt->ready, &dt->ready_m);
 }
 
-static void *dongle_thread_fn(void *arg)
-{
-	struct dongle_state *s = arg;
-	rtlsdr_read_async(s->dev, rtlsdr_callback, s, 0, s->buf_len);
-	return 0;
-}
-
 static void *demod_thread_fn(void *arg)
 {
 	struct demod_thread_state *dt = arg;
@@ -892,8 +880,10 @@ static void *controller_thread_fn(void *arg)
 	verbose_set_frequency(dongle.dev, dongle.freq);
 	fprintf(stderr, "Oversampling input by: %ix.\n", demod->downsample);
 	fprintf(stderr, "Oversampling output by: %ix.\n", demod->post_downsample);
-	fprintf(stderr, "Buffer size: %0.2fms\n",
-		1000 * 0.5 * (float)ACTUAL_BUF_LENGTH / (float)dongle.rate);
+	fprintf(stderr, "Buffer size: %u Bytes == %u quadrature samples == %0.2fms\n",
+		(unsigned)dongle.buf_len,
+		(unsigned)dongle.buf_len / 2,
+		1000 * 0.5 * (float)dongle.buf_len / (float)dongle.rate);
 
 	/* Set the sample rate */
 	if (verbosity)
@@ -1078,6 +1068,7 @@ void demod_thread_init(struct demod_thread_state *s, struct output_state *output
 
 void demod_thread_cleanup(struct demod_thread_state *s)
 {
+	demod_cleanup(&s->demod);
 	pthread_rwlock_destroy(&s->rw);
 	pthread_cond_destroy(&s->ready);
 	pthread_mutex_destroy(&s->ready_m);
@@ -1142,7 +1133,6 @@ int main(int argc, char **argv)
 	int r, opt;
 	int dev_given = 0;
 	int writeWav = 0;
-	int custom_ppm = 0;
 	int enable_biastee = 0;
 	const char * rtlOpts = NULL;
 	enum rtlsdr_ds_mode ds_mode = RTLSDR_DS_IQ;
@@ -1218,7 +1208,6 @@ int main(int argc, char **argv)
 			break;
 		case 'p':
 			dongle.ppm_error = atoi(optarg);
-			custom_ppm = 1;
 			break;
 		case 'R':
 			time(&stop_time);
@@ -1324,13 +1313,15 @@ int main(int argc, char **argv)
 			break;
 		case 'W':
 			dongle.buf_len = 512 * atoi(optarg);
-			if (dongle.buf_len > MAXIMUM_BUF_LENGTH)
+			if (dongle.buf_len > MAXIMUM_BUF_LENGTH) {
+				fprintf(stderr, "Warning: limiting buffers from option -W to %d\n", MAXIMUM_BUF_LENGTH / 512);
 				dongle.buf_len = MAXIMUM_BUF_LENGTH;
+			}
 			break;
 		case 'h':
 		case '?':
 		default:
-			usage();
+			usage(verbosity);
 			break;
 		}
 	}
@@ -1354,8 +1345,6 @@ int main(int argc, char **argv)
 	} else {
 		output.filename = "-";
 	}
-
-	ACTUAL_BUF_LENGTH = lcm_post[demod->post_downsample] * DEFAULT_BUF_LENGTH;
 
 	if (!dev_given) {
 		dongle.dev_index = verbose_device_search("0");
@@ -1411,19 +1400,7 @@ int main(int argc, char **argv)
 	verbose_set_bandwidth(dongle.dev, dongle.bandwidth);
 
 	if (verbosity && dongle.bandwidth)
-	{
-		int r;
-		uint32_t in_bw, out_bw, last_bw = 0;
-		fprintf(stderr, "Supported bandwidth values in kHz:\n");
-		for ( in_bw = 1; in_bw < 3200; ++in_bw )
-		{
-			r = rtlsdr_set_and_get_tuner_bandwidth(dongle.dev, in_bw*1000, &out_bw, 0 /* =apply_bw */);
-			if ( r == 0 && out_bw != 0 && ( out_bw != last_bw || in_bw == 1 ) )
-				fprintf(stderr, "%s%.1f", (in_bw==1 ? "" : ", "), out_bw/1000.0 );
-			last_bw = out_bw;
-		}
-		fprintf(stderr,"\n");
-	}
+		verbose_list_bandwidths(dongle.dev);
 
 	if (rtlOpts) {
 		rtlsdr_set_opt_string(dongle.dev, rtlOpts, verbosity);
@@ -1468,11 +1445,8 @@ int main(int argc, char **argv)
 	usleep(1000000); /* it looks, that startup of dongle level takes some time at startup! */
 	pthread_create(&output.thread, NULL, output_thread_fn, (void *)(&output));
 	pthread_create(&dm_thr.thread, NULL, demod_thread_fn, (void *)(&dm_thr));
-	pthread_create(&dongle.thread, NULL, dongle_thread_fn, (void *)(&dongle));
 
-	while (!do_exit) {
-		usleep(100000);
-	}
+	rtlsdr_read_async(dongle.dev, rtlsdr_callback, &dongle, 0, dongle.buf_len);
 
 	if (do_exit) {
 		fprintf(stderr, "\nUser cancel, exiting...\n");}
@@ -1480,7 +1454,6 @@ int main(int argc, char **argv)
 		fprintf(stderr, "\nLibrary error %d, exiting...\n", r);}
 
 	rtlsdr_cancel_async(dongle.dev);
-	pthread_join(dongle.thread, NULL);
 	safe_cond_signal(&dm_thr.ready, &dm_thr.ready_m);
 	pthread_join(dm_thr.thread, NULL);
 	safe_cond_signal(&output.ready, &output.ready_m);

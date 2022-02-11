@@ -51,10 +51,8 @@ struct demod_state
 {
 	int16_t * lowpassed;	/* input and decimated quadrature I/Q sample-pairs */
 	int16_t * result;	/* demodulated inphase signal */
-	int16_t * result_mpx;	/* demodulated inphase signal */
 	int	  lp_len;	/* number of valid samples in lowpassed[] - NOT quadrature I/Q sample-pairs! */
 	int	  result_len;	/* number of valid samples in result[] */
-	int	  result_mpx_len;	/* number of valid samples in result[] */
 
 #if 1
 	int16_t   lp_i_hist[MAXIMUM_DOWNSAMPLE_PASSES][6];
@@ -104,7 +102,7 @@ struct demod_state
 };
 
 void demod_init(struct demod_state *s, int init_fields, int init_mem);
-void demod_copy_fields(struct demod_state *dest, struct demod_state *src);
+void demod_copy_fields(struct demod_state *dest, const struct demod_state *src);
 void demod_cleanup(struct demod_state *s);
 
 void mixer_init(struct mixer_state *mixer, double rel_freq, double samplerate);
