@@ -69,9 +69,9 @@
 #define MAX_NUM_CHANNELS        32
 #define MAX_CIRCULAR_BUFFERS    128
 
-#define DEFAULT_MPX_PIPE_PATTERN	"redsea -r %sf >%i_%mf_%F_%H:%M:%S_%#_rds.txt"
+#define DEFAULT_MPX_PIPE_PATTERN	"redsea -r %sf >%i_%mf_%F_%H-%M-%S_%#_rds.txt"
 #define DEFAULT_MPX_FILE_PATTERN	"%i_%F_%H-%M-%S_%#_ch-%cf_mpx.raw"
-#define DEFAULT_AUDIO_PIPE_PATTERN	"ffmpeg -f s16le -ar %sf -ac 1 -i pipe: -loglevel quiet %i_%mf_%F_%H:%M:%S_%#.mp3"
+#define DEFAULT_AUDIO_PIPE_PATTERN	"ffmpeg -f s16le -ar %sf -ac 1 -i pipe: -loglevel quiet %i_%mf_%F_%H-%M-%S_%#.mp3"
 #define DEFAULT_AUDIO_FILE_PATTERN	"%i_%F_%H-%M-%S_%#_ch-%cf_audio.raw"
 
 /* type: 0: nothing, 1: file, 2: pipe */
