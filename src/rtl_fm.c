@@ -1068,7 +1068,7 @@ void dongle_init(struct dongle_state *s)
 
 void demod_thread_init(struct demod_thread_state *s, struct output_state *output, struct cmd_state *cmd)
 {
-	demod_init(&s->demod);
+	demod_init(&s->demod, 1, 1);
 	pthread_rwlock_init(&s->rw, NULL);
 	pthread_cond_init(&s->ready, NULL);
 	pthread_mutex_init(&s->ready_m, NULL);
