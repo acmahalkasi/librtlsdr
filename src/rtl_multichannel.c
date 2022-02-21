@@ -71,7 +71,9 @@
 
 #define DEFAULT_MPX_PIPE_PATTERN	"redsea -r %sf >%F_%H-%M-%S_%#_ch-%cf_rds.txt"
 #define DEFAULT_MPX_FILE_PATTERN	"%F_%H-%M-%S_%#_ch-%cf_mpx.raw"
-#define DEFAULT_AUDIO_PIPE_PATTERN	"ffmpeg -f s16le -ar %sf -ac 1 -i pipe: -loglevel quiet %F_%H-%M-%S_%#_ch-%cf_audio.mp3"
+/* #define DEFAULT_AUDIO_PIPE_PATTERN	"ffmpeg -f s16le -ar %sf -ac 1 -i pipe: -loglevel quiet %F_%H-%M-%S_%#_ch-%cf_audio.mp3" */
+/* prefer .ogg over .mp3: mp3 encoding produces some milliseconds (approx 80 ms) at start of every new file! ogg encoded files look gapless */
+#define DEFAULT_AUDIO_PIPE_PATTERN	"oggenc -r --raw-endianness 0 -B 16 -C 1 -R %sf -q 2 -Q -o %F_%H-%M-%S_%#_ch-%cf_audio.ogg"
 #define DEFAULT_AUDIO_FILE_PATTERN	"%F_%H-%M-%S_%#_ch-%cf_audio.raw"
 
 /* type: 0: nothing, 1: file, 2: pipe */
@@ -144,6 +146,8 @@ struct demod_thread_state
 	const char *audio_file_pattern;
 	const char *mpx_file_pattern;
 	int audio_write_type;	/* 0: nothing, 1: file, 2: pipe */
+	int audio_frame_modulo;
+	int audio_frame_size;	/* e.g. 4608 (=multiple of 512 and 1152) for mp3 */
 	int mpx_write_type;
 	struct p_closing_thread audio_p_closing_thread[MAX_NUM_CHANNELS]; /* specific for pipe closing */
 	struct p_closing_thread mpx_p_closing_thread[MAX_NUM_CHANNELS]; /* specific for pipe closing */
@@ -207,8 +211,9 @@ void usage(int verbosity)
 		"\t	raw mode outputs 2x16 bit IQ pairs\n"
 		"\t[-m minimum_capture_rate Hz (default: 1m, min=900k, max=3.2m)]\n"
 		"\t[-s sample_rate (default: 24k)]\n"
-		"\t[-t [x:|a:]split duration in seconds to split files (default: off)]\n"
+		"\t[-t [x:|a:|af:] split duration in seconds to split files (default: off)]\n"
 		"\t     x:|a:   split the mpx or audio signal. without that prefix, both are split\n"
+		"\t     af:     split audio at multiples of size samples, e.g. 4608 for mp3. size must be multiple of 512\n"
 		"\t[-l [x:|a:]limit duration in seconds from (split) begin (default: off)]\n"
 		"\t[-a audio pipe command or file pattern (default: file) with substitutions similar to strftime(), ie.\n"
 		"\t\t\"p:%s\"\n"
@@ -412,6 +417,8 @@ void close_all_channel_outputs(struct demod_thread_state *s, int close_mpx, int 
 	const char * outstr = (close_mpx && close_audio) ? "mpx and audio" : ( close_mpx ? "mpx" : (close_audio ? "audio" : "???") );
 	if (verbosity)
 		fprintf(stderr, "dongle %s: closing all %s outputs %s utilizing threads\n", dongleid, outstr, (use_thread ? "with" : "without") );
+	if (close_audio)
+		s->audio_frame_modulo = 0;
 	for(int ch = 0; ch < s->channel_count; ++ch) {
 		FILE *f = s->faudio[ch];
 		if (f && close_audio) {
@@ -495,6 +502,7 @@ void open_all_audio_channel_outputs(struct demod_thread_state *s, const unsigned
 
 	if (verbosity)
 		fprintf(stderr, "dongle %s: opening all %d outputs for audio stream\n", dongleid, s->channel_count);
+	s->audio_frame_modulo = 0;
 	for(int ch = 0; ch < s->channel_count; ++ch) {
 		uint32_t freq = s->center_freq + s->freqs[ch];
 
@@ -511,7 +519,7 @@ void open_all_audio_channel_outputs(struct demod_thread_state *s, const unsigned
 }
 
 
-void full_demod(struct demod_state *d, FILE *f_mpx, FILE *f_audio)
+void full_demod(struct demod_state *d, FILE *f_mpx, FILE *f_audio, int *audio_frame_modulo, int audio_frame_size)
 {
 	int nwritten;
 
@@ -543,6 +551,12 @@ void full_demod(struct demod_state *d, FILE *f_mpx, FILE *f_audio)
 	}
 
 	nwritten = (int)fwrite(d->result, 2, d->result_len, f_audio);
+	if (audio_frame_modulo && audio_frame_size) {
+		/* we want to split - only at multiples of 1152 samples, the frame size of an mp3
+		 * that is lcm(512, 1152) = 4608 == 9 x 512
+		 */
+		*audio_frame_modulo = (*audio_frame_modulo + d->result_len) % audio_frame_size;
+	}
 	if (nwritten != d->result_len)
 		fprintf(stderr, "dongle %s: error writing %d audio samples .. result %d\n", dongleid, d->result_len, nwritten);
 }
@@ -711,7 +725,7 @@ static void *multi_demod_thread_fn(void *arg)
 				mpx_is_limited = 0;
 				t1_mpx = buffer->tv;
 			}
-			if (unlikely(init_open || (mds->audio_split_duration > 0 && diff_ms_audio > 1000.0 * mds->audio_split_duration))) {
+			if (unlikely(init_open || (mds->audio_split_duration > 0 && mds->audio_frame_modulo == 0 && diff_ms_audio > 1000.0 * mds->audio_split_duration))) {
 				struct tm *tm = localtime(&buffer->tv.tv_sec);
 				const int milli = (int)(buffer->tv.tv_usec/1000);
 				close_all_channel_outputs(mds, 0, 1, 1);	/* close audio files or pipes */
@@ -732,7 +746,8 @@ static void *multi_demod_thread_fn(void *arg)
 			pthread_rwlock_unlock(&buffer->rw);
 
 			for (ch = 0; ch < mds->channel_count; ++ch) {
-				full_demod(&mds->demod_states[ch], mds->fmpx[ch], mds->faudio[ch]);
+				int * p_frame_modulo = (!ch) ? &(mds->audio_frame_modulo) : NULL;
+				full_demod(&mds->demod_states[ch], mds->fmpx[ch], mds->faudio[ch], p_frame_modulo, mds->audio_frame_size);
 			}
 		}
 	}
@@ -922,6 +937,8 @@ void demod_thread_state_init(struct demod_thread_state *s)
 
 	s->audio_write_type = DEFAULT_AUDIO_WRITE_TYPE;
 	s->mpx_write_type = DEFAULT_MPX_WRITE_TYPE;
+	s->audio_frame_modulo = 0;
+	s->audio_frame_size = 0;
 
 	s->center_freq = 100000000;
 
@@ -1057,6 +1074,12 @@ int main(int argc, char **argv)
 				dm_thr.mpx_split_duration = atoi(&optarg[2]);
 			} else if (!strncmp(optarg, "a:", 2)) {
 				dm_thr.audio_split_duration = atoi(&optarg[2]);
+			} else if (!strncmp(optarg, "af:", 3)) {
+				dm_thr.audio_frame_size = atoi(&optarg[3]);
+				if ((dm_thr.audio_frame_size % 512) != 0) {
+					dm_thr.audio_frame_size = dm_thr.audio_frame_size & (~511);
+					fprintf(stderr, "split frame size needs to be multiple of 512. corrected to %d\n", dm_thr.audio_frame_size);
+				}
 			} else {
 				dm_thr.audio_split_duration = atoi(optarg);
 				dm_thr.mpx_split_duration = dm_thr.audio_split_duration;
