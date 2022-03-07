@@ -227,7 +227,7 @@ void usage(int verbosity)
 		"\t[-o on_overflow (default: (q)uit), other options: (d)iscard all buffers, (i)gnore and discard single buffer\n"
 		"\t\t  discard does close/reopen the files or pipes\n"
 		"\t[-r resample_rate (default: none / same as -s)]\n"
-		"\t[-d device_index or serial (default: 0)]\n"
+		"\t[-d device_index or serial (default: 0 , -1 or '-' for stdin)]\n"
 		"%s"
 		"\t[-T enable bias-T on GPIO PIN 0 (works for rtl-sdr.com v3 dongles)]\n"
 		"\t[-D direct_sampling_mode (default: 0, 1 = I, 2 = Q, 3 = I below threshold, 4 = Q below threshold)]\n"
@@ -267,7 +267,8 @@ sighandler(int signum)
 	if (CTRL_C_EVENT == signum) {
 		fprintf(stderr, "dongle %s: Signal caught, exiting!\n", dongleid);
 		do_exit = 1;
-		rtlsdr_cancel_async(dongle.dev);
+		if (dongle.dev)
+			rtlsdr_cancel_async(dongle.dev);
 		return TRUE;
 	}
 	return FALSE;
@@ -277,7 +278,8 @@ static void sighandler(int signum)
 {
 	fprintf(stderr, "dongle %s: Signal caught, exiting!\n", dongleid);
 	do_exit = 1;
-	rtlsdr_cancel_async(dongle.dev);
+	if (dongle.dev)
+		rtlsdr_cancel_async(dongle.dev);
 }
 #endif
 
@@ -588,7 +590,8 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 			unsigned rcv_counter = mds->buffer_rcv_counter;
 			unsigned proc_counter = mds->buffer_proc_counter;
 			do_exit = 1;
-			rtlsdr_cancel_async(dongle.dev);
+			if (dongle.dev)
+				rtlsdr_cancel_async(dongle.dev);
 			fprintf(stderr, "\n\n*** dongle %s: Overflow of circular input buffers, exiting! ***\n", dongleid);
 			fprintf(stderr, "dongle %s: Overflow happened after having read %u buffers from dongle.\n", dongleid, rcv_counter);
 			fprintf(stderr, "dongle %s: Overflow happened after having processed %u buffers.\n", dongleid, proc_counter);
@@ -606,7 +609,8 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 	if (duration > 0 && buffer->tv.tv_sec >= stop_time) {
 		do_exit = 1;
 		fprintf(stderr, "dongle %s: Time expired, exiting!\n", dongleid);
-		rtlsdr_cancel_async(dongle.dev);
+		if (dongle.dev)
+			rtlsdr_cancel_async(dongle.dev);
 		pthread_rwlock_unlock(&buffer->rw);
 		return;
 	}
@@ -646,6 +650,27 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 	pthread_rwlock_unlock(&buffer->rw);
 	safe_cond_signal(&mds->ready, &mds->ready_m);
 }
+
+
+int read_from_stdin() {
+	size_t nmemb = dongle.buf_len / ( 2 * sizeof(uint8_t) );
+	unsigned char *buf = (unsigned char *)malloc(nmemb * sizeof(uint16_t));
+#ifdef _WIN32
+	_setmode(_fileno(stdin), _O_BINARY);
+#endif
+
+	while (!do_exit && !feof(stdin)) {
+		/* @todo: check/wait for a free buffer? */
+		/* assume input is rate limited with pv -L */
+		size_t rd = fread(buf, sizeof(uint16_t), nmemb, stdin);
+		if (rd != nmemb)
+			return 1;
+		rtlsdr_callback(buf, 2 *nmemb, &dongle);
+	}
+	free(buf);
+	return 0;
+}
+
 
 static void *multi_demod_thread_fn(void *arg)
 {
@@ -807,14 +832,17 @@ static int controller_fn(struct demod_thread_state *s)
 	if (r) {
 		return r;
 	}
-	if (dongle.direct_sampling) {
-		verbose_direct_sampling(dongle.dev, 1);}
 
-	/* Set the frequency */
-	if (verbosity) {
-		fprintf(stderr, "dongle %s: verbose_set_frequency(%f MHz)\n", dongleid, dongle.freq * 1E-6);
+	if (dongle.dev) {
+		if (dongle.direct_sampling) {
+			verbose_direct_sampling(dongle.dev, 1);}
+
+		/* Set the frequency */
+		if (verbosity) {
+			fprintf(stderr, "dongle %s: verbose_set_frequency(%f MHz)\n", dongleid, dongle.freq * 1E-6);
+		}
+		verbose_set_frequency(dongle.dev, dongle.freq);
 	}
-	verbose_set_frequency(dongle.dev, dongle.freq);
 
 	dongle_rate = dongle.rate;
 	nyq_max = dongle_rate /2;
@@ -838,10 +866,12 @@ static int controller_fn(struct demod_thread_state *s)
 		(unsigned)dongle.buf_len / 2,
 		1000 * 0.5 * (float)dongle.buf_len / (float)dongle.rate);
 
-	/* Set the sample rate */
-	if (verbosity)
-		fprintf(stderr, "verbose_set_sample_rate(%.0f Hz)\n", (double)dongle.rate);
-	verbose_set_sample_rate(dongle.dev, dongle.rate);
+	if (dongle.dev) {
+		/* Set the sample rate */
+		if (verbosity)
+			fprintf(stderr, "verbose_set_sample_rate(%.0f Hz)\n", (double)dongle.rate);
+		verbose_set_sample_rate(dongle.dev, dongle.rate);
+	}
 	fprintf(stderr, "Output at %u Hz.\n", demod_config->rate_in/demod_config->post_downsample);
 
 	return 0;
@@ -1019,6 +1049,7 @@ int main(int argc, char **argv)
 #endif
 	int r, opt;
 	int dev_given = 0;
+	int dev_stdin = 0;
 	int enable_biastee = 0;
 	const char * rtlOpts = NULL;
 	struct demod_state *demod = NULL;
@@ -1034,6 +1065,8 @@ int main(int argc, char **argv)
 		switch (opt) {
 		case 'd':
 			dongle.dev_index = verbose_device_search(optarg);
+			if (dongle.dev_index == -2)
+				dev_stdin = 1;
 			dongleid = optarg;
 			dev_given = 1;
 			break;
@@ -1294,15 +1327,23 @@ int main(int argc, char **argv)
 		dongleid = "0";
 	}
 
-	if (dongle.dev_index < 0) {
+	if (dongle.dev_index < 0 && !dev_stdin) {
 		exit(1);
 	}
 
-	r = rtlsdr_open(&dongle.dev, (uint32_t)dongle.dev_index);
-	if (r < 0) {
-		fprintf(stderr, "Failed to open rtlsdr device #%d.\n", dongle.dev_index);
-		exit(1);
+	if (!dev_stdin) {
+		r = rtlsdr_open(&dongle.dev, (uint32_t)dongle.dev_index);
+		if (r < 0) {
+			fprintf(stderr, "Failed to open rtlsdr device #%d.\n", dongle.dev_index);
+			exit(1);
+		}
 	}
+	else
+	{
+		dongle.dev = NULL;
+		r = 0;
+	}
+
 #ifndef _WIN32
 	sigact.sa_handler = sighandler;
 	sigemptyset(&sigact.sa_mask);
@@ -1315,44 +1356,48 @@ int main(int argc, char **argv)
 	SetConsoleCtrlHandler( (PHANDLER_ROUTINE) sighandler, TRUE );
 #endif
 
-	/* Set the tuner gain */
-	if (dongle.gain == AUTO_GAIN) {
-		verbose_auto_gain(dongle.dev);
-	} else {
-		dongle.gain = nearest_gain(dongle.dev, dongle.gain);
-		verbose_gain_set(dongle.dev, dongle.gain);
+	if (dongle.dev) {
+
+		/* Set the tuner gain */
+		if (dongle.gain == AUTO_GAIN) {
+			verbose_auto_gain(dongle.dev);
+		} else {
+			dongle.gain = nearest_gain(dongle.dev, dongle.gain);
+			verbose_gain_set(dongle.dev, dongle.gain);
+		}
+
+		rtlsdr_set_agc_mode(dongle.dev, rtlagc);
+
+		rtlsdr_set_bias_tee(dongle.dev, enable_biastee);
+		if (enable_biastee)
+			fprintf(stderr, "activated bias-T on GPIO PIN 0\n");
+
+		verbose_ppm_set(dongle.dev, dongle.ppm_error);
+
+		/* Set direct sampling with threshold */
+		rtlsdr_set_ds_mode(dongle.dev, ds_mode, ds_threshold);
+
+		verbose_set_bandwidth(dongle.dev, dongle.bandwidth);
+
+		if (verbosity && dongle.bandwidth)
+			verbose_list_bandwidths(dongle.dev);
+
+		if (rtlOpts) {
+			rtlsdr_set_opt_string(dongle.dev, rtlOpts, verbosity);
+		}
+
+		/* r = rtlsdr_set_testmode(dongle.dev, 1); */
+
+		/* Reset endpoint before we start reading from it (mandatory) */
+		verbose_reset_buffer(dongle.dev);
+
+		if (r) {
+			rtlsdr_close(dongle.dev);
+			return 1;
+		}
 	}
-
-	rtlsdr_set_agc_mode(dongle.dev, rtlagc);
-
-	rtlsdr_set_bias_tee(dongle.dev, enable_biastee);
-	if (enable_biastee)
-		fprintf(stderr, "activated bias-T on GPIO PIN 0\n");
-
-	verbose_ppm_set(dongle.dev, dongle.ppm_error);
-
-	/* Set direct sampling with threshold */
-	rtlsdr_set_ds_mode(dongle.dev, ds_mode, ds_threshold);
-
-	verbose_set_bandwidth(dongle.dev, dongle.bandwidth);
-
-	if (verbosity && dongle.bandwidth)
-		verbose_list_bandwidths(dongle.dev);
-
-	if (rtlOpts) {
-		rtlsdr_set_opt_string(dongle.dev, rtlOpts, verbosity);
-	}
-
-	/* r = rtlsdr_set_testmode(dongle.dev, 1); */
-
-	/* Reset endpoint before we start reading from it (mandatory) */
-	verbose_reset_buffer(dongle.dev);
 
 	controller_fn(&dm_thr);
-	if (r) {
-		rtlsdr_close(dongle.dev);
-		return 1;
-	}
 
 	/* open pipe closing threads if need */
 	for (int ch = 0; ch < dm_thr.channel_count; ++ch) {
@@ -1367,14 +1412,18 @@ int main(int argc, char **argv)
 
 	pthread_create(&dm_thr.thread, NULL, multi_demod_thread_fn, (void *)(&dm_thr));
 
-	rtlsdr_read_async(dongle.dev, rtlsdr_callback, &dongle, 0, dongle.buf_len);
+	if (dongle.dev)
+		rtlsdr_read_async(dongle.dev, rtlsdr_callback, &dongle, 0, dongle.buf_len);
+	else
+		r = read_from_stdin();
 
 	if (do_exit) {
 		fprintf(stderr, "\nUser cancel, exiting...\n");}
 	else {
 		fprintf(stderr, "\nLibrary error %d, exiting...\n", r);}
 
-	rtlsdr_cancel_async(dongle.dev);
+	if (dongle.dev)
+		rtlsdr_cancel_async(dongle.dev);
 
 	do_exit = 1;
 	safe_cond_signal(&dm_thr.ready, &dm_thr.ready_m);
@@ -1404,9 +1453,11 @@ int main(int argc, char **argv)
 		fprintf(stderr, "wait for demod_thread cleanup ..\n");
 	demod_thread_cleanup(&dm_thr);
 
-	if (verbosity)
-		fprintf(stderr, "closing dongle and exit\n");
-	rtlsdr_close(dongle.dev);
+	if (dongle.dev) {
+		if (verbosity)
+			fprintf(stderr, "closing dongle and exit\n");
+		rtlsdr_close(dongle.dev);
+	}
 
 	if (num_detected_overflows || num_discarded_buffers || verbosity)
 		fprintf(stderr, "dongle %s: detected %u overflows, discarded %u of %u received buffers in total\n", dongleid, num_detected_overflows, num_discarded_buffers, dm_thr.buffer_rcv_counter);
