@@ -73,7 +73,7 @@
 #define DEFAULT_MPX_FILE_PATTERN	"%F_%H-%M-%S_%#_ch-%cf_mpx.raw"
 /* #define DEFAULT_AUDIO_PIPE_PATTERN	"ffmpeg -f s16le -ar %sf -ac 1 -i pipe: -loglevel quiet %F_%H-%M-%S_%#_ch-%cf_audio.mp3" */
 /* prefer .ogg over .mp3: mp3 encoding produces some milliseconds (approx 80 ms) at start of every new file! ogg encoded files look gapless */
-#define DEFAULT_AUDIO_PIPE_PATTERN	"oggenc -r --raw-endianness 0 -B 16 -C 1 -R %sf -q 2 -Q -o %F_%H-%M-%S_%#_ch-%cf_audio.ogg"
+#define DEFAULT_AUDIO_PIPE_PATTERN	"oggenc -r --raw-endianness 0 -B 16 -C 1 -R %sf -q 2 -Q -o %F_%H-%M-%S_%#_ch-%cf_audio.ogg -"
 #define DEFAULT_AUDIO_FILE_PATTERN	"%F_%H-%M-%S_%#_ch-%cf_audio.raw"
 
 /* type: 0: nothing, 1: file, 2: pipe */
@@ -790,7 +790,7 @@ static int optimal_settings(uint64_t freq, uint32_t rate)
 	struct demod_state *config = &dt->demod_states[0];
 	config->downsample = (MinCaptureRate / config->rate_in) + 1;
 	if (config->downsample_passes) {
-		config->downsample_passes = (int)log2(config->downsample) + 1;
+		config->downsample_passes = (int)( ceil(log2(config->downsample)) + 0.1);
 		if (config->downsample_passes > MAXIMUM_DOWNSAMPLE_PASSES) {
 			fprintf(stderr, "downsample_passes = %d exceeds it's limit. setting to %d\n", config->downsample, MAXIMUM_DOWNSAMPLE_PASSES);
 			config->downsample_passes = MAXIMUM_DOWNSAMPLE_PASSES;
