@@ -71,9 +71,9 @@
 
 #define DEFAULT_MPX_PIPE_PATTERN	"redsea -r %sf >%F_%H-%M-%S_%#_ch-%cf_rds.txt"
 #define DEFAULT_MPX_FILE_PATTERN	"%F_%H-%M-%S_%#_ch-%cf_mpx.raw"
-/* #define DEFAULT_AUDIO_PIPE_PATTERN	"ffmpeg -f s16le -ar %sf -ac 1 -i pipe: -loglevel quiet %F_%H-%M-%S_%#_ch-%cf_audio.mp3" */
 /* prefer .ogg over .mp3: mp3 encoding produces some milliseconds (approx 80 ms) at start of every new file! ogg encoded files look gapless */
-#define DEFAULT_AUDIO_PIPE_PATTERN	"oggenc -r --raw-endianness 0 -B 16 -C 1 -R %sf -q 2 -Q -o %F_%H-%M-%S_%#_ch-%cf_audio.ogg -"
+#define AUDIO_MP3_PIPE_PATTERN		"ffmpeg -f s16le -ar %sf -ac 1 -i pipe: -loglevel quiet %F_%H-%M-%S_%#_ch-%cf_audio.mp3"
+#define AUDIO_OGG_PIPE_PATTERN		"oggenc -r --raw-endianness 0 -B 16 -C 1 -R %sf -q 2 -Q -o %F_%H-%M-%S_%#_ch-%cf_audio.ogg -"
 #define DEFAULT_AUDIO_FILE_PATTERN	"%F_%H-%M-%S_%#_ch-%cf_audio.raw"
 
 /* type: 0: nothing, 1: file, 2: pipe */
@@ -254,7 +254,7 @@ void usage(int verbosity)
 		"\t	size can be 0 or 9.  0 has bad roll off\n"
 		"\t[-A std/fast/lut/ale choose atan math (default: std)]\n"
 		"\n"
-		, DEFAULT_AUDIO_PIPE_PATTERN, DEFAULT_AUDIO_FILE_PATTERN
+		, AUDIO_OGG_PIPE_PATTERN, DEFAULT_AUDIO_FILE_PATTERN
 		, DEFAULT_MPX_PIPE_PATTERN, DEFAULT_MPX_FILE_PATTERN
 		, rtlsdr_get_opt_help(verbosity) );
 	exit(1);
@@ -962,7 +962,7 @@ void demod_thread_state_init(struct demod_thread_state *s)
 
 	s->mpx_pipe_pattern = DEFAULT_MPX_PIPE_PATTERN;
 	s->mpx_file_pattern = DEFAULT_MPX_FILE_PATTERN;
-	s->audio_pipe_pattern = DEFAULT_AUDIO_PIPE_PATTERN;
+	s->audio_pipe_pattern = AUDIO_OGG_PIPE_PATTERN;
 	s->audio_file_pattern = DEFAULT_AUDIO_FILE_PATTERN;
 
 	s->audio_write_type = DEFAULT_AUDIO_WRITE_TYPE;
@@ -1172,6 +1172,12 @@ int main(int argc, char **argv)
 		case 'a':
 			if (!strcmp(optarg, "n") || !strcmp(optarg, "N") || !strcmp(optarg, "%")) {
 				dm_thr.audio_write_type = 0;
+			} else if (!strcmp(optarg, "p:ogg")) {
+				dm_thr.audio_pipe_pattern = AUDIO_OGG_PIPE_PATTERN;
+				dm_thr.audio_write_type = 2;
+			} else if (!strcmp(optarg, "p:mp3")) {
+				dm_thr.audio_pipe_pattern = AUDIO_MP3_PIPE_PATTERN;
+				dm_thr.audio_write_type = 2;
 			} else if (!strncmp(optarg, "p:", 2)) {
 				if (optarg[2])
 					dm_thr.audio_pipe_pattern = &optarg[2];
