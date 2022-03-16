@@ -109,10 +109,11 @@ struct demod_input_buffer
 	struct timeval		tv;	/* timestamp of reception */
 };
 
-struct p_closing_thread
-{	
-	FILE *fptr;
-	atomic_int has_file;
+struct file_thread_data
+{
+	FILE *fptr[2];
+	atomic_int is_closing[2];	/* => close still running (in thread) */
+	int open_idx;		/* fptr[] idx to use for [p]open() => close_idx = 1 - open_idx */
 	pthread_t closing_thread;
 	pthread_cond_t ready;
 	pthread_mutex_t ready_m;
@@ -139,8 +140,6 @@ struct demod_thread_state
 	atomic_uint buffer_proc_counter;	/* processed buffers */
 	int	  dummyPadE[128 / sizeof(int)];
 
-	FILE    * faudio[MAX_NUM_CHANNELS];
-	FILE    * fmpx[MAX_NUM_CHANNELS];
 	const char *audio_pipe_pattern;
 	const char *mpx_pipe_pattern;
 	const char *audio_file_pattern;
@@ -149,8 +148,8 @@ struct demod_thread_state
 	int audio_frame_modulo;
 	int audio_frame_size;	/* e.g. 4608 (=multiple of 512 and 1152) for mp3 */
 	int mpx_write_type;
-	struct p_closing_thread audio_p_closing_thread[MAX_NUM_CHANNELS]; /* specific for pipe closing */
-	struct p_closing_thread mpx_p_closing_thread[MAX_NUM_CHANNELS]; /* specific for pipe closing */
+	struct file_thread_data audio_files[MAX_NUM_CHANNELS]; /* specific for audio */
+	struct file_thread_data mpx_files[MAX_NUM_CHANNELS]; /* specific for mpx */
 
 	int mpx_split_duration;		/* split file or pipe in seconds */
 	int audio_split_duration;
@@ -367,48 +366,49 @@ int strfchannel(char *s, int max, const char * format, const int chno, const uin
 	return dest_pos;
 }
 
-static FILE * open_pipe(const char *command, const char * st) {
+static FILE * open_pipe(const char *command, const char * st, int ch, int slot) {
 	FILE *f = popen(command, "w");
 	if (!f) {
-		fprintf(stderr, "dongle %s: Error: Could not open %s pipe for '%s' !\n", dongleid, st, command);
+		fprintf(stderr, "dongle %s: Error: Could not open %s pipe (ch %d slot %d) for '%s' !\n", dongleid, st, ch, slot, command);
 		return f;
 	}
 	if (verbosity) {
-		fprintf(stdout, "dongle %s: %s pipe opened: '%s'\n", dongleid, st, command);
+		fprintf(stdout, "dongle %s: %s pipe (ch %d slot %d) opened: '%s'\n", dongleid, st, ch, slot, command);
 		fflush(stdout);
 	}
 	return f;
 }
 
-static FILE * create_iq_file(const char* filename, const char * st) {
+static FILE * create_iq_file(const char* filename, const char * st, int ch, int slot) {
 	FILE * f = fopen(filename, "wb");
 	if(!f) {
-		fprintf(stderr, "dongle %s: Error: Could not create %s file '%s' !\n", dongleid, st, filename);
+		fprintf(stderr, "dongle %s: Error: Could not create %s (ch %d slot %d) file '%s' !\n", dongleid, st, ch, slot, filename);
 		return f;
 	}
 	if (verbosity) {
-		fprintf(stdout, "dongle %s: %s file created: %s\n", dongleid, st, filename);
+		fprintf(stdout, "dongle %s: %s file (ch %d slot %d) created: %s\n", dongleid, st, ch, slot, filename);
 		fflush(stdout);
 	}
 	return f;
 }
 
 static void *close_pipe_fn(void* arg) {
-	struct p_closing_thread *ct = arg;
+	struct file_thread_data *ct = arg;
 	FILE *f = NULL;
 	while (!do_exit) {
 		safe_cond_wait(&ct->ready, &ct->ready_m);
 		while (!do_exit) {
 			/* close (multiple) files per signaled condition */
-			if (!ct->has_file)
+			int close_idx = 1 - ct->open_idx;
+			if (!ct->is_closing[close_idx])
 				break;
-			/* copy fptr, to keep ct->has_file == 1 as short as possible */
-			f = ct->fptr;
-			ct->has_file = 0;
-			if (!f)
-				continue;
-			fflush(f);
-			pclose(f);
+			f = ct->fptr[close_idx];
+			if (!f) {
+				fflush(f);
+				pclose(f);
+			}
+			ct->fptr[close_idx] = NULL;
+			ct->is_closing[close_idx] = 0;
 		}
 	}
 	return 0;
@@ -422,54 +422,57 @@ void close_all_channel_outputs(struct demod_thread_state *s, int close_mpx, int 
 	if (close_audio)
 		s->audio_frame_modulo = 0;
 	for(int ch = 0; ch < s->channel_count; ++ch) {
-		FILE *f = s->faudio[ch];
-		if (f && close_audio) {
+		if (close_audio) {
+			struct file_thread_data *ct = &(s->audio_files[ch]);
+			const int close_idx = ct->open_idx;
+			FILE *f = ct->fptr[close_idx];
 			if (s->audio_write_type == 2) {
 				if(use_thread) {
-					if(s->audio_p_closing_thread[ch].has_file) {
-						fprintf(stderr, "dongle %s: Error: pclose() has not finished for audio channel %d\n", dongleid, ch);
+					if(ct->is_closing[close_idx]) {
+						fprintf(stderr, "dongle %s: Error: pclose() already/still running for audio (ch %d, slot %d)\n", dongleid, ch, close_idx);
 					}
 					else {
-						s->audio_p_closing_thread[ch].fptr = f;
-						s->audio_p_closing_thread[ch].has_file = 1;
-						safe_cond_signal(&s->audio_p_closing_thread[ch].ready, &s->audio_p_closing_thread[ch].ready_m);
-						s->faudio[ch] = NULL;
+						ct->open_idx = close_idx;
+						ct->is_closing[close_idx] = 1;
+						safe_cond_signal(&ct->ready, &ct->ready_m);
 					}
-				} else {
+				} else if (f) {
 					fflush(f);
 					pclose(f);
-					s->faudio[ch] = NULL;
+					ct->fptr[close_idx] = NULL;
 				}
-			} else if (s->audio_write_type == 1) {
+			}
+			else if (s->audio_write_type == 1 && f) {
 				fflush(f);
 				fclose(f);
-				s->faudio[ch] = NULL;
+				ct->fptr[close_idx] = NULL;
 			}
 		}
 
-		f = s->fmpx[ch];
-		if (f && close_mpx) {
-			if (s->mpx_write_type == 2)
+		if (close_mpx) {
+			struct file_thread_data *ct = &(s->mpx_files[ch]);
+			const int close_idx = ct->open_idx;
+			FILE *f = ct->fptr[close_idx];
+			if (s->mpx_write_type == 2) {
 				if(use_thread) {
-					if(s->mpx_p_closing_thread[ch].has_file) {
-						fprintf(stderr, "dongle %s: Error: pclose() has not finished for mpx channel %d\n", dongleid, ch);
+					if(ct->is_closing[close_idx]) {
+						fprintf(stderr, "dongle %s: Error: pclose() has not finished for mpx (ch %d, slot %d)\n", dongleid, ch, close_idx);
 					}
 					else {
-						s->mpx_p_closing_thread[ch].fptr = f;
-						s->mpx_p_closing_thread[ch].has_file = 1;
-						safe_cond_signal(&s->mpx_p_closing_thread[ch].ready, &s->mpx_p_closing_thread[ch].ready_m);
-						s->fmpx[ch] = NULL;
+						ct->open_idx = close_idx;
+						ct->is_closing[close_idx] = 1;
+						safe_cond_signal(&ct->ready, &ct->ready_m);
 					}
-				} else {
+				} else if (f) {
 					fflush(f);
-					pclose(f);	
-					s->fmpx[ch] = NULL;
+					pclose(f);
+					ct->fptr[close_idx] = NULL;
 				}
-			else if (s->mpx_write_type == 1)
-			{
+			}
+			else if (s->mpx_write_type == 1 && f) {
 				fflush(f);
-				fclose(f);			
-				s->fmpx[ch] = NULL;
+				fclose(f);
+				ct->fptr[close_idx] = NULL;
 			}
 		}
 	}
@@ -484,15 +487,20 @@ void open_all_mpx_channel_outputs(struct demod_thread_state *s, const unsigned m
 		fprintf(stderr, "dongle %s: opening all %d outputs for mpx stream\n", dongleid, s->channel_count);
 	for(int ch = 0; ch < s->channel_count; ++ch) {
 		uint32_t freq = s->center_freq + s->freqs[ch];
-
+		struct file_thread_data *ct = &(s->mpx_files[ch]);
+		const int open_idx = ct->open_idx;
+		if (ct->is_closing[open_idx]) {
+			fprintf(stderr, "dongle %s: Error: [p]close() not finished for mpx (ch %d, slot %d). Skipping [p]open()!\n", dongleid, ch, open_idx);
+			continue;
+		}
 		if (s->mpx_write_type == 2) {
 			strfchannel(fnTmp, ARRAY_LEN(fnTmp), s->mpx_pipe_pattern, ch, freq, mpx_rate, milli, 0);
 			strftime(fnTim, ARRAY_LEN(fnTim), fnTmp, tm);
-			s->fmpx[ch] = open_pipe(fnTim, "mpx");
+			ct->fptr[open_idx] = open_pipe(fnTim, "mpx", ch, open_idx);
 		} else if (s->mpx_write_type == 1) {
 			strfchannel(fnTmp, ARRAY_LEN(fnTmp), s->mpx_file_pattern, ch, freq, mpx_rate, milli, 0);
 			strftime(fnTim, ARRAY_LEN(fnTim), fnTmp, tm);
-			s->fmpx[ch] = create_iq_file(fnTim, "mpx");
+			ct->fptr[open_idx] = create_iq_file(fnTim, "mpx", ch, open_idx);
 		}
 	}
 }
@@ -507,15 +515,20 @@ void open_all_audio_channel_outputs(struct demod_thread_state *s, const unsigned
 	s->audio_frame_modulo = 0;
 	for(int ch = 0; ch < s->channel_count; ++ch) {
 		uint32_t freq = s->center_freq + s->freqs[ch];
-
+		struct file_thread_data *ct = &(s->audio_files[ch]);
+		const int open_idx = ct->open_idx;
+		if (ct->is_closing[open_idx]) {
+			fprintf(stderr, "dongle %s: Error: [p]close() not finished for audio (ch %d, slot %d). Skipping [p]open()!\n", dongleid, ch, open_idx);
+			continue;
+		}
 		if (s->audio_write_type == 2) {
 			strfchannel(fnTmp, ARRAY_LEN(fnTmp), s->audio_pipe_pattern, ch, freq, audio_rate, milli, 0);
 			strftime(fnTim, ARRAY_LEN(fnTim), fnTmp, tm);
-			s->faudio[ch] = open_pipe(fnTim, "audio");
+			ct->fptr[open_idx] = open_pipe(fnTim, "audio", ch, open_idx);
 		} else if (s->audio_write_type == 1) {
 			strfchannel(fnTmp, ARRAY_LEN(fnTmp), s->audio_file_pattern, ch, freq, audio_rate, milli, 0);
 			strftime(fnTim, ARRAY_LEN(fnTim), fnTmp, tm);
-			s->faudio[ch] = create_iq_file(fnTim, "audio");
+			ct->fptr[open_idx] = create_iq_file(fnTim, "audio", ch, open_idx);
 		}
 	}
 }
@@ -772,7 +785,11 @@ static void *multi_demod_thread_fn(void *arg)
 
 			for (ch = 0; ch < mds->channel_count; ++ch) {
 				int * p_frame_modulo = (!ch) ? &(mds->audio_frame_modulo) : NULL;
-				full_demod(&mds->demod_states[ch], mds->fmpx[ch], mds->faudio[ch], p_frame_modulo, mds->audio_frame_size);
+				full_demod(
+					&mds->demod_states[ch],
+					mds->mpx_files[ch].fptr[ mds->mpx_files[ch].open_idx ],
+					mds->audio_files[ch].fptr[ mds->audio_files[ch].open_idx ],
+					p_frame_modulo, mds->audio_frame_size);
 			}
 		}
 	}
@@ -927,20 +944,25 @@ void demod_thread_state_init(struct demod_thread_state *s)
 {
 	for (int ch = 0; ch < MAX_NUM_CHANNELS; ++ch) {
 		demod_init(&s->demod_states[ch], 1, 0);
-		s->faudio[ch] = NULL;
-		s->fmpx[ch] = NULL;
+		s->audio_files[ch].fptr[0] = NULL;
+		s->audio_files[ch].fptr[1] = NULL;
+		s->audio_files[ch].is_closing[0] = 0;
+		s->audio_files[ch].is_closing[1] = 0;
+		s->audio_files[ch].open_idx = 0;
+		s->audio_files[ch].is_mpx = 0;
+		s->audio_files[ch].ch = ch;
+		pthread_cond_init(&s->audio_files[ch].ready, NULL);
+		pthread_mutex_init(&s->audio_files[ch].ready_m, NULL);
 
-		s->audio_p_closing_thread[ch].fptr = NULL;
-		s->audio_p_closing_thread[ch].is_mpx = 0;
-		s->audio_p_closing_thread[ch].ch = ch;
-		pthread_cond_init(&s->audio_p_closing_thread[ch].ready, NULL);
-		pthread_mutex_init(&s->audio_p_closing_thread[ch].ready_m, NULL);
-
-		s->mpx_p_closing_thread[ch].fptr = NULL;
-		s->mpx_p_closing_thread[ch].is_mpx = 1;
-		s->mpx_p_closing_thread[ch].ch = ch;
-		pthread_cond_init(&s->mpx_p_closing_thread[ch].ready, NULL);
-		pthread_mutex_init(&s->mpx_p_closing_thread[ch].ready_m, NULL);
+		s->mpx_files[ch].fptr[0] = NULL;
+		s->mpx_files[ch].fptr[1] = NULL;
+		s->mpx_files[ch].is_closing[0] = 0;
+		s->mpx_files[ch].is_closing[1] = 0;
+		s->mpx_files[ch].open_idx = 0;
+		s->mpx_files[ch].is_mpx = 1;
+		s->mpx_files[ch].ch = ch;
+		pthread_cond_init(&s->mpx_files[ch].ready, NULL);
+		pthread_mutex_init(&s->mpx_files[ch].ready_m, NULL);
 	}
 
 	s->num_circular_buffers = 4;
@@ -1011,10 +1033,10 @@ void demod_thread_cleanup(struct demod_thread_state *s)
 	}
 
 	for (int i = 0; i < MAX_NUM_CHANNELS; ++i) {
-		pthread_cond_destroy(&s->audio_p_closing_thread[i].ready);
-		pthread_cond_destroy(&s->mpx_p_closing_thread[i].ready);
-		pthread_mutex_destroy(&s->audio_p_closing_thread[i].ready_m);
-		pthread_mutex_destroy(&s->mpx_p_closing_thread[i].ready_m);
+		pthread_cond_destroy(&s->audio_files[i].ready);
+		pthread_cond_destroy(&s->mpx_files[i].ready);
+		pthread_mutex_destroy(&s->audio_files[i].ready_m);
+		pthread_mutex_destroy(&s->mpx_files[i].ready_m);
 	}
 
 	for (int k=0; k < MAX_CIRCULAR_BUFFERS; ++k) {
@@ -1408,11 +1430,11 @@ int main(int argc, char **argv)
 	/* open pipe closing threads if need */
 	for (int ch = 0; ch < dm_thr.channel_count; ++ch) {
 		if (dm_thr.audio_write_type == 2 && dm_thr.audio_split_duration > 0) {
-			pthread_create(&dm_thr.audio_p_closing_thread[ch].closing_thread, NULL, close_pipe_fn, (&dm_thr.audio_p_closing_thread[ch]));
+			pthread_create(&dm_thr.audio_files[ch].closing_thread, NULL, close_pipe_fn, (&dm_thr.audio_files[ch]));
 		}
 
 		if (dm_thr.mpx_write_type == 2 && dm_thr.mpx_split_duration > 0) {
-			pthread_create(&dm_thr.mpx_p_closing_thread[ch].closing_thread, NULL, close_pipe_fn, (&dm_thr.mpx_p_closing_thread[ch]));
+			pthread_create(&dm_thr.mpx_files[ch].closing_thread, NULL, close_pipe_fn, (&dm_thr.mpx_files[ch]));
 		}
 	}
 
@@ -1440,17 +1462,17 @@ int main(int argc, char **argv)
 	/* close the  closing threads */
 	for (int ch = 0; ch < dm_thr.channel_count; ++ch) {
 		if (dm_thr.audio_write_type == 2 && dm_thr.audio_split_duration > 0) {
-			safe_cond_signal(&dm_thr.audio_p_closing_thread[ch].ready, &dm_thr.audio_p_closing_thread[ch].ready_m);
+			safe_cond_signal(&dm_thr.audio_files[ch].ready, &dm_thr.audio_files[ch].ready_m);
 			if (verbosity)
 				fprintf(stderr, "wait for audio channel %d's pclose() thread to finish ..\n", ch);
-			pthread_join(dm_thr.audio_p_closing_thread[ch].closing_thread, NULL);
+			pthread_join(dm_thr.audio_files[ch].closing_thread, NULL);
 		}
 
 		if (dm_thr.mpx_write_type == 2 && dm_thr.mpx_split_duration > 0) {
-			safe_cond_signal(&dm_thr.mpx_p_closing_thread[ch].ready, &dm_thr.mpx_p_closing_thread[ch].ready_m);
+			safe_cond_signal(&dm_thr.mpx_files[ch].ready, &dm_thr.mpx_files[ch].ready_m);
 			if (verbosity)
 				fprintf(stderr, "wait for mpx channel %d's pclose() thread to finish ..\n", ch);
-			pthread_join(dm_thr.mpx_p_closing_thread[ch].closing_thread, NULL);
+			pthread_join(dm_thr.mpx_files[ch].closing_thread, NULL);
 		}
 	}
 
