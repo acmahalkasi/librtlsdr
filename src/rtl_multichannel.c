@@ -112,6 +112,7 @@ struct demod_input_buffer
 struct file_thread_data
 {
 	FILE *fptr[2];
+	atomic_int to_close[2];	/* => close to run */
 	atomic_int is_closing[2];	/* => close still running (in thread) */
 	int open_idx;		/* fptr[] idx to use for [p]open() => close_idx = 1 - open_idx */
 	pthread_t closing_thread;
@@ -119,6 +120,7 @@ struct file_thread_data
 	pthread_mutex_t ready_m;
 	int is_mpx;
 	int ch;
+	unsigned fno;
 };
 
 struct demod_thread_state
@@ -222,7 +224,7 @@ void usage(int verbosity)
 		"\t\tthe default pipe command pattern: \"p:%s\"\n"
 		"\t\tthe default filename pattern: \"f:%s\"\n"
 		"\t\t  substitutions, additional to strftime(): %%f for frequency, %%kf for frequency in kHz,\n"
-		"\t\t  %%sf for samplerate, %%cf for channel number, and %%# for milliseconds of time\n"
+		"\t\t  %%sf for samplerate, %%cf for channel number, %%nf for file no and %%# for milliseconds of time\n"
 		"\t[-o on_overflow (default: (q)uit), other options: (d)iscard all buffers, (i)gnore and discard single buffer\n"
 		"\t\t  discard does close/reopen the files or pipes\n"
 		"\t[-r resample_rate (default: none / same as -s)]\n"
@@ -294,7 +296,7 @@ static double log2(double n)
 #endif
 
 
-int strfchannel(char *s, int max, const char * format, const int chno, const uint32_t freq, const unsigned rate, const int milli, const int rep_esc)
+int strfchannel(char *s, int max, const char * format, const int chno, unsigned * fno, const uint32_t freq, const unsigned rate, const int milli, const int rep_esc)
 {
 	/* rep_esc == 0: %% is NOT replaced for later call to strftime() */
 	/* replaced strings:
@@ -302,12 +304,14 @@ int strfchannel(char *s, int max, const char * format, const int chno, const uin
 	 * %kf => frequency in kHz
 	 * %cf => channel number: 0 ..
 	 * %sf => sample frequency = rate
+	 * %nf => file number
 	 * %#  => ms
 	 */
 	int r, dest_pos = 0;
 	const int fmt_len = strlen(format);
 	const char escape = '%';
 
+	++(*fno);
 	for (int fmt_pos = 0; fmt_pos < fmt_len; ) {
 		if (dest_pos >= max -1)
 			break;
@@ -352,6 +356,12 @@ int strfchannel(char *s, int max, const char * format, const int chno, const uin
 				dest_pos += r;
 				fmt_pos += 3;
 			}
+			else if (format[fmt_pos+1] == 'n' && format[fmt_pos+2] == 'f') {
+				/* %nf : file number */
+				r = snprintf(&s[dest_pos], max - dest_pos, "%u", *fno);
+				dest_pos += r;
+				fmt_pos += 3;
+			}
 			else {
 				s[dest_pos++] = format[fmt_pos++];
 			}
@@ -366,27 +376,27 @@ int strfchannel(char *s, int max, const char * format, const int chno, const uin
 	return dest_pos;
 }
 
-static FILE * open_pipe(const char *command, const char * st, int ch, int slot) {
+static FILE * open_pipe(const char *command, const char * st, int ch, int slot, unsigned fno) {
 	FILE *f = popen(command, "w");
 	if (!f) {
-		fprintf(stderr, "dongle %s: Error: Could not open %s pipe (ch %d slot %d) for '%s' !\n", dongleid, st, ch, slot, command);
+		fprintf(stderr, "dongle %s: Error: Could not open %u.th %s pipe (ch %d slot %d) for '%s' !\n", dongleid, fno, st, ch, slot, command);
 		return f;
 	}
 	if (verbosity) {
-		fprintf(stdout, "dongle %s: %s pipe (ch %d slot %d) opened: '%s'\n", dongleid, st, ch, slot, command);
+		fprintf(stdout, "dongle %s: %u.th %s pipe (ch %d slot %d) opened: '%s'\n", dongleid, fno, st, ch, slot, command);
 		fflush(stdout);
 	}
 	return f;
 }
 
-static FILE * create_iq_file(const char* filename, const char * st, int ch, int slot) {
+static FILE * create_iq_file(const char* filename, const char * st, int ch, int slot, unsigned fno) {
 	FILE * f = fopen(filename, "wb");
 	if(!f) {
-		fprintf(stderr, "dongle %s: Error: Could not create %s (ch %d slot %d) file '%s' !\n", dongleid, st, ch, slot, filename);
+		fprintf(stderr, "dongle %s: Error: Could not create %u.th %s (ch %d slot %d) file '%s' !\n", dongleid, fno, st, ch, slot, filename);
 		return f;
 	}
 	if (verbosity) {
-		fprintf(stdout, "dongle %s: %s file (ch %d slot %d) created: %s\n", dongleid, st, ch, slot, filename);
+		fprintf(stdout, "dongle %s: %u.th %s file (ch %d slot %d) created: %s\n", dongleid, fno, st, ch, slot, filename);
 		fflush(stdout);
 	}
 	return f;
@@ -396,19 +406,37 @@ static void *close_pipe_fn(void* arg) {
 	struct file_thread_data *ct = arg;
 	FILE *f = NULL;
 	while (!do_exit) {
+		int worked = 1;
 		safe_cond_wait(&ct->ready, &ct->ready_m);
-		while (!do_exit) {
+		while (!do_exit && worked) {
 			/* close (multiple) files per signaled condition */
-			int close_idx = 1 - ct->open_idx;
-			if (!ct->is_closing[close_idx])
-				break;
-			f = ct->fptr[close_idx];
-			if (!f) {
-				fflush(f);
-				pclose(f);
+			worked = 0;
+			for (int close_idx = 0; close_idx < 2; ++close_idx) {
+				if (ct->is_closing[close_idx] || !ct->to_close[close_idx])
+					continue;
+				ct->is_closing[close_idx] = 1;
+				f = ct->fptr[close_idx];
+				if (f) {
+					time_t tstart = time(NULL);
+					worked = 1;
+					if (verbosity >= 2)
+						fprintf(stderr, "starting pclose() of %s-channel %d slot %d..\n", ct->is_mpx ? "mpx" : "audio", ct->ch, close_idx);
+					fflush(f);
+					pclose(f);
+					if (verbosity >= 2) {
+						int tdur = (int)(time(NULL) - tstart);
+						fprintf(stderr, "finished pclose() of %s-channel %d slot %d in %u seconds\n", ct->is_mpx ? "mpx" : "audio", ct->ch, close_idx, tdur);
+					}
+				}
+				else {
+					fprintf(stderr, "skipped pclose() of %s-channel %d slot %d: already closed.\n", ct->is_mpx ? "mpx" : "audio", ct->ch, close_idx);
+				}
+				ct->fptr[close_idx] = NULL;
+				ct->to_close[close_idx] = 0;
+				ct->is_closing[close_idx] = 0;
 			}
-			ct->fptr[close_idx] = NULL;
-			ct->is_closing[close_idx] = 0;
+			if (!worked)
+				break;
 		}
 	}
 	return 0;
@@ -426,14 +454,14 @@ void close_all_channel_outputs(struct demod_thread_state *s, int close_mpx, int 
 			struct file_thread_data *ct = &(s->audio_files[ch]);
 			const int close_idx = ct->open_idx;
 			FILE *f = ct->fptr[close_idx];
+			ct->open_idx = 1 - ct->open_idx;
 			if (s->audio_write_type == 2) {
-				if(use_thread) {
-					if(ct->is_closing[close_idx]) {
+				if(use_thread && f) {
+					if(ct->to_close[close_idx]) {
 						fprintf(stderr, "dongle %s: Error: pclose() already/still running for audio (ch %d, slot %d)\n", dongleid, ch, close_idx);
 					}
 					else {
-						ct->open_idx = close_idx;
-						ct->is_closing[close_idx] = 1;
+						ct->to_close[close_idx] = 1;
 						safe_cond_signal(&ct->ready, &ct->ready_m);
 					}
 				} else if (f) {
@@ -453,14 +481,14 @@ void close_all_channel_outputs(struct demod_thread_state *s, int close_mpx, int 
 			struct file_thread_data *ct = &(s->mpx_files[ch]);
 			const int close_idx = ct->open_idx;
 			FILE *f = ct->fptr[close_idx];
+			ct->open_idx = 1 - ct->open_idx;
 			if (s->mpx_write_type == 2) {
-				if(use_thread) {
-					if(ct->is_closing[close_idx]) {
-						fprintf(stderr, "dongle %s: Error: pclose() has not finished for mpx (ch %d, slot %d)\n", dongleid, ch, close_idx);
+				if(use_thread && f) {
+					if(ct->to_close[close_idx]) {
+						fprintf(stderr, "dongle %s: Error: close() not finished for mpx (ch %d, slot %d)\n", dongleid, ch, close_idx);
 					}
 					else {
-						ct->open_idx = close_idx;
-						ct->is_closing[close_idx] = 1;
+						ct->to_close[close_idx] = 1;
 						safe_cond_signal(&ct->ready, &ct->ready_m);
 					}
 				} else if (f) {
@@ -489,18 +517,18 @@ void open_all_mpx_channel_outputs(struct demod_thread_state *s, const unsigned m
 		uint32_t freq = s->center_freq + s->freqs[ch];
 		struct file_thread_data *ct = &(s->mpx_files[ch]);
 		const int open_idx = ct->open_idx;
-		if (ct->is_closing[open_idx]) {
-			fprintf(stderr, "dongle %s: Error: [p]close() not finished for mpx (ch %d, slot %d). Skipping [p]open()!\n", dongleid, ch, open_idx);
+		if (ct->is_closing[open_idx] || ct->to_close[open_idx]) {
+			fprintf(stderr, "dongle %s: Error: close() not finished for mpx (ch %d, slot %d). Skipping [p]open()!\n", dongleid, ch, open_idx);
 			continue;
 		}
 		if (s->mpx_write_type == 2) {
-			strfchannel(fnTmp, ARRAY_LEN(fnTmp), s->mpx_pipe_pattern, ch, freq, mpx_rate, milli, 0);
+			strfchannel(fnTmp, ARRAY_LEN(fnTmp), s->mpx_pipe_pattern, ch, &ct->fno, freq, mpx_rate, milli, 0);
 			strftime(fnTim, ARRAY_LEN(fnTim), fnTmp, tm);
-			ct->fptr[open_idx] = open_pipe(fnTim, "mpx", ch, open_idx);
+			ct->fptr[open_idx] = open_pipe(fnTim, "mpx", ch, open_idx, ct->fno);
 		} else if (s->mpx_write_type == 1) {
-			strfchannel(fnTmp, ARRAY_LEN(fnTmp), s->mpx_file_pattern, ch, freq, mpx_rate, milli, 0);
+			strfchannel(fnTmp, ARRAY_LEN(fnTmp), s->mpx_file_pattern, ch, &ct->fno, freq, mpx_rate, milli, 0);
 			strftime(fnTim, ARRAY_LEN(fnTim), fnTmp, tm);
-			ct->fptr[open_idx] = create_iq_file(fnTim, "mpx", ch, open_idx);
+			ct->fptr[open_idx] = create_iq_file(fnTim, "mpx", ch, open_idx, ct->fno);
 		}
 	}
 }
@@ -517,18 +545,18 @@ void open_all_audio_channel_outputs(struct demod_thread_state *s, const unsigned
 		uint32_t freq = s->center_freq + s->freqs[ch];
 		struct file_thread_data *ct = &(s->audio_files[ch]);
 		const int open_idx = ct->open_idx;
-		if (ct->is_closing[open_idx]) {
-			fprintf(stderr, "dongle %s: Error: [p]close() not finished for audio (ch %d, slot %d). Skipping [p]open()!\n", dongleid, ch, open_idx);
+		if (ct->is_closing[open_idx] || ct->to_close[open_idx]) {
+			fprintf(stderr, "dongle %s: Error: close() not finished for audio (ch %d, slot %d). Skipping [p]open()!\n", dongleid, ch, open_idx);
 			continue;
 		}
 		if (s->audio_write_type == 2) {
-			strfchannel(fnTmp, ARRAY_LEN(fnTmp), s->audio_pipe_pattern, ch, freq, audio_rate, milli, 0);
+			strfchannel(fnTmp, ARRAY_LEN(fnTmp), s->audio_pipe_pattern, ch, &ct->fno, freq, audio_rate, milli, 0);
 			strftime(fnTim, ARRAY_LEN(fnTim), fnTmp, tm);
-			ct->fptr[open_idx] = open_pipe(fnTim, "audio", ch, open_idx);
+			ct->fptr[open_idx] = open_pipe(fnTim, "audio", ch, open_idx, ct->fno);
 		} else if (s->audio_write_type == 1) {
-			strfchannel(fnTmp, ARRAY_LEN(fnTmp), s->audio_file_pattern, ch, freq, audio_rate, milli, 0);
+			strfchannel(fnTmp, ARRAY_LEN(fnTmp), s->audio_file_pattern, ch, &ct->fno, freq, audio_rate, milli, 0);
 			strftime(fnTim, ARRAY_LEN(fnTim), fnTmp, tm);
-			ct->fptr[open_idx] = create_iq_file(fnTim, "audio", ch, open_idx);
+			ct->fptr[open_idx] = create_iq_file(fnTim, "audio", ch, open_idx, ct->fno);
 		}
 	}
 }
@@ -665,19 +693,23 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 }
 
 
-int read_from_stdin() {
+int read_from_file(FILE * f) {
 	size_t nmemb = dongle.buf_len / ( 2 * sizeof(uint8_t) );
 	unsigned char *buf = (unsigned char *)malloc(nmemb * sizeof(uint16_t));
+	struct demod_thread_state *mds = dongle.demod_target;
 #ifdef _WIN32
-	_setmode(_fileno(stdin), _O_BINARY);
+	if (f == stdin)
+		_setmode(_fileno(f), _O_BINARY);
 #endif
 
-	while (!do_exit && !feof(stdin)) {
+	while (!do_exit && !feof(f)) {
 		/* @todo: check/wait for a free buffer? */
 		/* assume input is rate limited with pv -L */
-		size_t rd = fread(buf, sizeof(uint16_t), nmemb, stdin);
+		size_t rd = fread(buf, sizeof(uint16_t), nmemb, f);
 		if (rd != nmemb)
 			return 1;
+		while (!mds->buffers[mds->buffer_write_idx].is_free)
+			usleep(1000);
 		rtlsdr_callback(buf, 2 *nmemb, &dongle);
 	}
 	free(buf);
@@ -946,21 +978,27 @@ void demod_thread_state_init(struct demod_thread_state *s)
 		demod_init(&s->demod_states[ch], 1, 0);
 		s->audio_files[ch].fptr[0] = NULL;
 		s->audio_files[ch].fptr[1] = NULL;
+		s->audio_files[ch].to_close[0] = 0;
+		s->audio_files[ch].to_close[1] = 0;
 		s->audio_files[ch].is_closing[0] = 0;
 		s->audio_files[ch].is_closing[1] = 0;
 		s->audio_files[ch].open_idx = 0;
 		s->audio_files[ch].is_mpx = 0;
 		s->audio_files[ch].ch = ch;
+		s->audio_files[ch].fno = 0;
 		pthread_cond_init(&s->audio_files[ch].ready, NULL);
 		pthread_mutex_init(&s->audio_files[ch].ready_m, NULL);
 
 		s->mpx_files[ch].fptr[0] = NULL;
 		s->mpx_files[ch].fptr[1] = NULL;
+		s->mpx_files[ch].to_close[0] = 0;
+		s->mpx_files[ch].to_close[1] = 0;
 		s->mpx_files[ch].is_closing[0] = 0;
 		s->mpx_files[ch].is_closing[1] = 0;
 		s->mpx_files[ch].open_idx = 0;
 		s->mpx_files[ch].is_mpx = 1;
 		s->mpx_files[ch].ch = ch;
+		s->mpx_files[ch].fno = 0;
 		pthread_cond_init(&s->mpx_files[ch].ready, NULL);
 		pthread_mutex_init(&s->mpx_files[ch].ready_m, NULL);
 	}
@@ -1071,7 +1109,7 @@ int main(int argc, char **argv)
 #endif
 	int r, opt;
 	int dev_given = 0;
-	int dev_stdin = 0;
+	FILE * dev_file = NULL;
 	int enable_biastee = 0;
 	const char * rtlOpts = NULL;
 	struct demod_state *demod = NULL;
@@ -1086,10 +1124,18 @@ int main(int argc, char **argv)
 	while ((opt = getopt(argc, argv, "d:f:g:m:s:a:x:t:l:r:p:R:E:O:o:F:A:M:hTq:c:w:W:n:D:v")) != -1) {
 		switch (opt) {
 		case 'd':
-			dongle.dev_index = verbose_device_search(optarg);
-			if (dongle.dev_index == -2)
-				dev_stdin = 1;
-			dongleid = optarg;
+			if (strlen(optarg) >= 3 && !strncmp("f:", optarg, 2)) {
+				dev_file = fopen(&optarg[2], "rb");
+				dongleid = "file";
+			}
+			else if (!strcmp("-", optarg) || !strcmp("-1", optarg)) {
+				dev_file = stdin;
+				dongleid = "stdin";
+			}
+			else {
+				dongle.dev_index = verbose_device_search(optarg);
+				dongleid = optarg;
+			}
 			dev_given = 1;
 			break;
 		case 'f':
@@ -1355,11 +1401,11 @@ int main(int argc, char **argv)
 		dongleid = "0";
 	}
 
-	if (dongle.dev_index < 0 && !dev_stdin) {
+	if (dongle.dev_index < 0 && !dev_file) {
 		exit(1);
 	}
 
-	if (!dev_stdin) {
+	if (!dev_file) {
 		r = rtlsdr_open(&dongle.dev, (uint32_t)dongle.dev_index);
 		if (r < 0) {
 			fprintf(stderr, "Failed to open rtlsdr device #%d.\n", dongle.dev_index);
@@ -1443,12 +1489,17 @@ int main(int argc, char **argv)
 	if (dongle.dev)
 		rtlsdr_read_async(dongle.dev, rtlsdr_callback, &dongle, 0, dongle.buf_len);
 	else
-		r = read_from_stdin();
+		r = read_from_file(dev_file);
 
 	if (do_exit) {
-		fprintf(stderr, "\nUser cancel, exiting...\n");}
+		fprintf(stderr, "\nUser cancel, exiting...\n");
+	}
+	else if (dev_file) {
+		fprintf(stderr, "\nEnd of input file or stream...\n");
+	}
 	else {
-		fprintf(stderr, "\nLibrary error %d, exiting...\n", r);}
+		fprintf(stderr, "\nLibrary error %d, exiting...\n", r);
+	}
 
 	if (dongle.dev)
 		rtlsdr_cancel_async(dongle.dev);
