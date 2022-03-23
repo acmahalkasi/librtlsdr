@@ -535,11 +535,11 @@ void open_all_mpx_channel_outputs(struct demod_thread_state *s, const unsigned m
 			continue;
 		}
 		if (s->mpx_write_type == 2) {
-			strfchannel(fnTmp, ARRAY_LEN(fnTmp), dongle.city, s->mpx_pipe_pattern, ch, &ct->fno, freq, mpx_rate, milli, 0);
+			strfchannel(fnTmp, ARRAY_LEN(fnTmp), dongle.city, s->mpx_pipe_pattern, &ct->fno, ch, freq, mpx_rate, milli, 0);
 			strftime(fnTim, ARRAY_LEN(fnTim), fnTmp, tm);
 			ct->fptr[open_idx] = open_pipe(fnTim, "mpx", ch, open_idx, ct->fno);
 		} else if (s->mpx_write_type == 1) {
-			strfchannel(fnTmp, ARRAY_LEN(fnTmp), dongle.city, s->mpx_file_pattern, ch, &ct->fno, freq, mpx_rate, milli, 0);
+			strfchannel(fnTmp, ARRAY_LEN(fnTmp), dongle.city, s->mpx_file_pattern, &ct->fno, ch, freq, mpx_rate, milli, 0);
 			strftime(fnTim, ARRAY_LEN(fnTim), fnTmp, tm);
 			ct->fptr[open_idx] = create_iq_file(fnTim, "mpx", ch, open_idx, ct->fno);
 		}
@@ -563,11 +563,11 @@ void open_all_audio_channel_outputs(struct demod_thread_state *s, const unsigned
 			continue;
 		}
 		if (s->audio_write_type == 2) {
-			strfchannel(fnTmp, ARRAY_LEN(fnTmp), dongle.city, s->audio_pipe_pattern, ch, &ct->fno, freq, audio_rate, milli, 0);
+			strfchannel(fnTmp, ARRAY_LEN(fnTmp), dongle.city, s->audio_pipe_pattern, &ct->fno, ch, freq, audio_rate, milli, 0);
 			strftime(fnTim, ARRAY_LEN(fnTim), fnTmp, tm);
 			ct->fptr[open_idx] = open_pipe(fnTim, "audio", ch, open_idx, ct->fno);
 		} else if (s->audio_write_type == 1) {
-			strfchannel(fnTmp, ARRAY_LEN(fnTmp), dongle.city, s->audio_file_pattern, ch, &ct->fno, freq, audio_rate, milli, 0);
+			strfchannel(fnTmp, ARRAY_LEN(fnTmp), dongle.city, s->audio_file_pattern, &ct->fno, ch, freq, audio_rate, milli, 0);
 			strftime(fnTim, ARRAY_LEN(fnTim), fnTmp, tm);
 			ct->fptr[open_idx] = create_iq_file(fnTim, "audio", ch, open_idx, ct->fno);
 		}
@@ -1036,7 +1036,7 @@ void demod_thread_state_init(struct demod_thread_state *s)
 
 	s->mpx_pipe_pattern = DEFAULT_MPX_PIPE_PATTERN;
 	s->mpx_file_pattern = DEFAULT_MPX_FILE_PATTERN;
-	s->audio_pipe_pattern = DEFAULT_AUDIO_PIPE_PATTERN;
+	s->audio_pipe_pattern = AUDIO_MP3_PIPE_PATTERN;
 	s->audio_file_pattern = DEFAULT_AUDIO_FILE_PATTERN;
 
 	s->audio_write_type = DEFAULT_AUDIO_WRITE_TYPE;
